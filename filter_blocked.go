@@ -8,8 +8,6 @@ import (
 	"math"
 	"math/bits"
 	"unsafe"
-
-	"github.com/zeebo/xxh3"
 )
 
 // A Blocked Bloom Filter confines all k bits of a key to a single CPU cache
@@ -35,22 +33,20 @@ type BlockedFilter struct {
 	numBlocks uint64
 	k         uint
 	seed      uint64 // keyed-hash seed; 0 = unseeded (see RandomSeed / threat model)
+	hash      HashKind
+	hasher    Hasher
 }
 
-// NewBlocked builds a blocked filter with capacity for n items at fp.
-// It reuses the classic m/k estimate, then rounds m up to whole cache lines.
-// NOTE: because of uneven block load, the *actual* FP rate will be somewhat
-// higher than fp. For a guaranteed FP at the cost of more memory, use
+// NewBlocked builds a blocked filter with capacity for n items at fp, configured
+// by opts. It reuses the classic m/k estimate, then rounds m up to whole cache
+// lines. NOTE: because of uneven block load, the *actual* FP rate will be
+// somewhat higher than fp. For a guaranteed FP at the cost of more memory, use
 // NewBlockedTuned.
-func NewBlocked(n uint, fp float64) *BlockedFilter {
-	return NewBlockedWithSeed(n, fp, 0)
-}
-
-// NewBlockedWithSeed is NewBlocked keyed with a hashing seed (see RandomSeed).
-func NewBlockedWithSeed(n uint, fp float64, seed uint64) *BlockedFilter {
+func NewBlocked(n uint, fp float64, opts ...Option) *BlockedFilter {
+	c := buildConfig(opts)
 	m, k := EstimateParameters(n, fp)
 	numBlocks := uint64(math.Ceil(float64(m) / blockBits))
-	return newBlockedRaw(numBlocks, k, seed)
+	return newBlockedRaw(numBlocks, k, c)
 }
 
 // NewBlockedTuned builds a blocked filter whose *measured* FP rate at n items
@@ -58,12 +54,8 @@ func NewBlockedWithSeed(n uint, fp float64, seed uint64) *BlockedFilter {
 // compensate for uneven per-block load. This is the "spend spare RAM to get
 // both locality AND accuracy" tier. Returns a filter that typically uses
 // ~20-35% more bits than the classic estimate, but does 1 cache miss per op.
-func NewBlockedTuned(n uint, fp float64) *BlockedFilter {
-	return NewBlockedTunedWithSeed(n, fp, 0)
-}
-
-// NewBlockedTunedWithSeed is NewBlockedTuned keyed with a hashing seed (see RandomSeed).
-func NewBlockedTunedWithSeed(n uint, fp float64, seed uint64) *BlockedFilter {
+func NewBlockedTuned(n uint, fp float64, opts ...Option) *BlockedFilter {
+	c := buildConfig(opts)
 	if n == 0 {
 		n = 1
 	}
@@ -85,11 +77,36 @@ func NewBlockedTunedWithSeed(n uint, fp float64, seed uint64) *BlockedFilter {
 			bestBits, bestBlocks, bestK = bits, nb, k
 		}
 	}
-	return newBlockedRaw(bestBlocks, bestK, seed)
+	return newBlockedRaw(bestBlocks, bestK, c)
 }
 
-// newBlockedRaw allocates a blocked filter with an explicit block count, k, and seed.
-func newBlockedRaw(numBlocks uint64, k uint, seed uint64) *BlockedFilter {
+// NewBlockedWithSeed is shorthand for NewBlocked(n, fp, WithSeed(seed)).
+//
+// Deprecated: use NewBlocked(n, fp, WithSeed(seed)).
+func NewBlockedWithSeed(n uint, fp float64, seed uint64) *BlockedFilter {
+	return NewBlocked(n, fp, WithSeed(seed))
+}
+
+// NewBlockedTunedWithSeed is shorthand for NewBlockedTuned(n, fp, WithSeed(seed)).
+//
+// Deprecated: use NewBlockedTuned(n, fp, WithSeed(seed)).
+func NewBlockedTunedWithSeed(n uint, fp float64, seed uint64) *BlockedFilter {
+	return NewBlockedTuned(n, fp, WithSeed(seed))
+}
+
+// newBlockedRaw resolves the hasher (panicking on an unknown hash — a
+// construction-time programmer error) and allocates the filter.
+func newBlockedRaw(numBlocks uint64, k uint, c config) *BlockedFilter {
+	h, err := resolveHasher(c.hash)
+	if err != nil {
+		panic(err)
+	}
+	return allocBlocked(numBlocks, k, c.seed, c.hash, h)
+}
+
+// allocBlocked builds the struct from already-resolved parts (shared by
+// construction and deserialization, which resolves the hasher itself).
+func allocBlocked(numBlocks uint64, k uint, seed uint64, hash HashKind, hasher Hasher) *BlockedFilter {
 	if numBlocks < 1 {
 		numBlocks = 1
 	}
@@ -100,6 +117,8 @@ func newBlockedRaw(numBlocks uint64, k uint, seed uint64) *BlockedFilter {
 		numBlocks: numBlocks,
 		k:         maxU(1, k),
 		seed:      seed,
+		hash:      hash,
+		hasher:    hasher,
 	}
 }
 
@@ -180,11 +199,11 @@ func newAlignedBlocks(numBlocks uint64) (view, backing []uint64) {
 // blockOffset returns the index in f.blocks where the key's cache line starts,
 // plus the two 32-bit sub-hashes used to derive the k bit positions.
 func (f *BlockedFilter) blockOffset(data []byte) (off uint64, h1, h2 uint32) {
-	h := xxh3.Hash128Seed(data, f.seed)
-	blockIdx := h.Hi % f.numBlocks
+	hi, lo := f.hasher(data, f.seed)
+	blockIdx := hi % f.numBlocks
 	off = blockIdx * blockWords
-	h1 = uint32(h.Lo)
-	h2 = uint32(h.Lo >> 32)
+	h1 = uint32(lo)
+	h2 = uint32(lo >> 32)
 	return
 }
 
@@ -219,32 +238,41 @@ func (f *BlockedFilter) K() uint { return f.k }
 // Seed returns the hashing seed (0 means unseeded).
 func (f *BlockedFilter) Seed() uint64 { return f.seed }
 
+// Hash returns the hash function the filter uses.
+func (f *BlockedFilter) Hash() HashKind { return f.hash }
+
 // --- Serialization ---
 //
-// The current (v3) wire format is self-describing:
-//   [8] magic   "BBLM\x03\x00\x00\x00"   (byte 4 = format version)
+// The wire format is self-describing. v3 and v4 share a 40-byte header:
+//   [8] magic   "BBLM\x0v\x00\x00\x00"   (byte 4 = format version)
 //   [1] payload endianness   0 = little, 1 = big
-//   [7] reserved (zero)
+//   [1] hash kind            (v4 only; v3 implies XXH3)
+//   [6] reserved (zero)
 //   [8] numBlocks   (little-endian)
 //   [8] k           (little-endian)
 //   [8] seed        (little-endian)
 //   [numBlocks*64] raw bit array, one 64-byte cache line per block
 //
-// The payload is dumped raw for speed (a GB-scale filter would be far too slow
-// through reflection-based binary.Write). WriteTo always emits the host's byte
-// order and records it; ReadFrom byte-swaps on the rare cross-endian load, so
-// v3 files ARE portable — unlike v1/v2.
+// WriteTo bumps the version only when a field actually matters: an XXH3 filter
+// is written as v3 (still readable by older v0.3.0 code); a non-XXH3 filter is
+// written as v4 so older readers safely refuse it rather than mis-hashing.
 //
-// ReadFrom still reads every historical format:
-//   v1 (24-byte header): magic, numBlocks, k                 — seed 0, LE payload
-//   v2 (32-byte header): magic, numBlocks, k, seed           — LE payload
-//   v3 (40-byte header): as above, with declared endianness
-// Use cmd/convert to upgrade old files to v3.
+// The payload is dumped raw for speed. WriteTo emits the host's byte order and
+// records it; ReadFrom byte-swaps on the rare cross-endian load, so v3/v4 files
+// are portable — unlike v1/v2.
+//
+// ReadFrom reads every historical format:
+//   v1 (24-byte header): magic, numBlocks, k                 — seed 0, XXH3, LE
+//   v2 (32-byte header): + seed                              — XXH3, LE
+//   v3 (40-byte header): + endianness                        — XXH3
+//   v4 (40-byte header): + hash kind
+// Use cmd/convert to upgrade old files.
 
 const (
 	blockedHdrV1 = 24
 	blockedHdrV2 = 32
 	blockedHdrV3 = 40
+	blockedHdrV4 = 40
 )
 
 var blockedMagicPrefix = [4]byte{'B', 'B', 'L', 'M'}
@@ -263,12 +291,17 @@ func blocksAsBytes(blocks []uint64) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(&blocks[0])), len(blocks)*8)
 }
 
-// WriteTo writes a v3 representation of the filter to w. It returns the number
-// of bytes written. Wrap w in a bufio.Writer for disk/network.
+// WriteTo writes the filter to w (v3 for XXH3, v4 otherwise). It returns the
+// number of bytes written. Wrap w in a bufio.Writer for disk/network.
 func (f *BlockedFilter) WriteTo(w io.Writer) (int64, error) {
-	var hdr [blockedHdrV3]byte
+	var hdr [blockedHdrV4]byte
 	copy(hdr[0:4], blockedMagicPrefix[:])
-	hdr[4] = 3 // version
+	if f.hash == XXH3 {
+		hdr[4] = 3 // back-compatible with v0.3.0 readers
+	} else {
+		hdr[4] = 4
+		hdr[9] = byte(f.hash)
+	}
 	if nativeBigEndian {
 		hdr[8] = 1
 	}
@@ -306,6 +339,8 @@ func (f *BlockedFilter) ReadFrom(r io.Reader) (int64, error) {
 		restSize = blockedHdrV2 - 8
 	case 3:
 		restSize = blockedHdrV3 - 8
+	case 4:
+		restSize = blockedHdrV4 - 8
 	default:
 		return 8, fmt.Errorf("bloom: unsupported blocked format version %d", version)
 	}
@@ -318,6 +353,7 @@ func (f *BlockedFilter) ReadFrom(r io.Reader) (int64, error) {
 	var numBlocks, seed uint64
 	var k uint
 	payloadBig := false
+	hash := XXH3 // implicit for v1/v2/v3
 	switch version {
 	case 1:
 		numBlocks = binary.LittleEndian.Uint64(rest[0:8])
@@ -326,19 +362,27 @@ func (f *BlockedFilter) ReadFrom(r io.Reader) (int64, error) {
 		numBlocks = binary.LittleEndian.Uint64(rest[0:8])
 		k = uint(binary.LittleEndian.Uint64(rest[8:16]))
 		seed = binary.LittleEndian.Uint64(rest[16:24])
-	case 3:
+	case 3, 4:
 		payloadBig = rest[0] == 1
+		if version == 4 {
+			hash = HashKind(rest[1])
+		}
 		numBlocks = binary.LittleEndian.Uint64(rest[8:16])
 		k = uint(binary.LittleEndian.Uint64(rest[16:24]))
 		seed = binary.LittleEndian.Uint64(rest[24:32])
 	}
 
-	nf := newBlockedRaw(numBlocks, k, seed)
-	buf := blocksAsBytes(nf.blocks)
-	m, err := io.ReadFull(r, buf)
-	read := int64(8 + restSize + m)
+	hasher, err := resolveHasher(hash)
 	if err != nil {
-		return read, err
+		return int64(8 + restSize), err
+	}
+
+	nf := allocBlocked(numBlocks, k, seed, hash, hasher)
+	buf := blocksAsBytes(nf.blocks)
+	m, rerr := io.ReadFull(r, buf)
+	read := int64(8 + restSize + m)
+	if rerr != nil {
+		return read, rerr
 	}
 	if payloadBig != nativeBigEndian {
 		swapWords(nf.blocks)
@@ -357,7 +401,7 @@ func swapWords(words []uint64) {
 // MarshalBinary implements encoding.BinaryMarshaler.
 func (f *BlockedFilter) MarshalBinary() ([]byte, error) {
 	var buf bytes.Buffer
-	buf.Grow(blockedHdrV3 + len(f.blocks)*8)
+	buf.Grow(blockedHdrV4 + len(f.blocks)*8)
 	if _, err := f.WriteTo(&buf); err != nil {
 		return nil, err
 	}
@@ -372,7 +416,7 @@ func (f *BlockedFilter) UnmarshalBinary(data []byte) error {
 
 // Equal reports whether two blocked filters have identical shape and contents.
 func (f *BlockedFilter) Equal(g *BlockedFilter) bool {
-	if f.numBlocks != g.numBlocks || f.k != g.k || f.seed != g.seed {
+	if f.numBlocks != g.numBlocks || f.k != g.k || f.seed != g.seed || f.hash != g.hash {
 		return false
 	}
 	return bytes.Equal(blocksAsBytes(f.blocks), blocksAsBytes(g.blocks))

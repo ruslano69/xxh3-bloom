@@ -320,6 +320,126 @@ func TestSeededSerializationRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPluggableHashNoFalseNegatives(t *testing.T) {
+	for _, kind := range []xxhbloom.HashKind{xxhbloom.XXH3, xxhbloom.Murmur3} {
+		classic := xxhbloom.NewWithEstimates(20_000, 0.01, xxhbloom.WithHash(kind))
+		blocked := xxhbloom.NewBlockedTuned(20_000, 0.01, xxhbloom.WithHash(kind), xxhbloom.WithSeed(7))
+		buf := make([]byte, 8)
+		for i := 0; i < 20_000; i++ {
+			binary.BigEndian.PutUint64(buf, uint64(i))
+			classic.Add(buf)
+			blocked.Add(buf)
+		}
+		for i := 0; i < 20_000; i++ {
+			binary.BigEndian.PutUint64(buf, uint64(i))
+			if !classic.Test(buf) {
+				t.Fatalf("%v classic false negative at %d", kind, i)
+			}
+			if !blocked.Test(buf) {
+				t.Fatalf("%v blocked false negative at %d", kind, i)
+			}
+		}
+		if classic.Hash() != kind || blocked.Hash() != kind {
+			t.Fatalf("Hash() mismatch for %v", kind)
+		}
+	}
+}
+
+// Different hash → different bit pattern for the same keys.
+func TestDifferentHashDiffersBits(t *testing.T) {
+	a := xxhbloom.NewBlocked(10_000, 0.01, xxhbloom.WithHash(xxhbloom.XXH3))
+	b := xxhbloom.NewBlocked(10_000, 0.01, xxhbloom.WithHash(xxhbloom.Murmur3))
+	buf := make([]byte, 8)
+	for i := 0; i < 10_000; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		a.Add(buf)
+		b.Add(buf)
+	}
+	if a.Equal(b) {
+		t.Fatal("XXH3 and Murmur3 produced identical bits")
+	}
+}
+
+// A Murmur3 filter must serialize as v4 and round-trip with the hash preserved.
+func TestPluggableHashSerialization(t *testing.T) {
+	src := xxhbloom.NewBlockedTuned(20_000, 0.01, xxhbloom.WithHash(xxhbloom.Murmur3), xxhbloom.WithSeed(99))
+	buf := make([]byte, 8)
+	for i := 0; i < 20_000; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		src.Add(buf)
+	}
+	blob, err := src.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+	if blob[4] != 4 {
+		t.Fatalf("non-XXH3 filter must serialize as v4, got version %d", blob[4])
+	}
+	var dst xxhbloom.BlockedFilter
+	if err := dst.UnmarshalBinary(blob); err != nil {
+		t.Fatalf("UnmarshalBinary: %v", err)
+	}
+	if dst.Hash() != xxhbloom.Murmur3 || dst.Seed() != 99 {
+		t.Fatalf("hash/seed not preserved: hash=%v seed=%d", dst.Hash(), dst.Seed())
+	}
+	if !src.Equal(&dst) {
+		t.Fatal("Murmur3 round-trip not equal")
+	}
+	for i := 0; i < 20_000; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		if !dst.Test(buf) {
+			t.Fatalf("false negative after Murmur3 reload at %d", i)
+		}
+	}
+}
+
+// XXH3 filters must still serialize as v3 (back-compat with v0.3.0 readers).
+func TestXXH3StillWritesV3(t *testing.T) {
+	f := xxhbloom.NewBlocked(5_000, 0.01)
+	blob, _ := f.MarshalBinary()
+	if blob[4] != 3 {
+		t.Fatalf("XXH3 filter must serialize as v3, got version %d", blob[4])
+	}
+}
+
+// A registered custom hash round-trips; an unregistered kind fails to load.
+func TestCustomHashRegistry(t *testing.T) {
+	const myKind = xxhbloom.HashKind(200)
+	// trivial custom hash (fine for a test; not for production)
+	xxhbloom.RegisterHash(myKind, func(data []byte, seed uint64) (uint64, uint64) {
+		var hi, lo uint64 = seed, 1469598103934665603
+		for _, c := range data {
+			lo = (lo ^ uint64(c)) * 1099511628211
+			hi = (hi ^ lo) * 1099511628211
+		}
+		return hi, lo
+	})
+
+	src := xxhbloom.NewBlockedTuned(5_000, 0.01, xxhbloom.WithHash(myKind))
+	buf := make([]byte, 8)
+	for i := 0; i < 5_000; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		src.Add(buf)
+	}
+	blob, _ := src.MarshalBinary()
+
+	var dst xxhbloom.BlockedFilter
+	if err := dst.UnmarshalBinary(blob); err != nil {
+		t.Fatalf("registered custom hash should load: %v", err)
+	}
+	if dst.Hash() != myKind {
+		t.Fatalf("custom hash kind not preserved: %v", dst.Hash())
+	}
+
+	// Corrupt the kind byte to an unregistered value → load must fail cleanly.
+	bad := append([]byte(nil), blob...)
+	bad[9] = 201
+	var dst2 xxhbloom.BlockedFilter
+	if err := dst2.UnmarshalBinary(bad); err == nil {
+		t.Fatal("expected error loading filter with unregistered hash kind")
+	}
+}
+
 func TestTestAndAdd(t *testing.T) {
 	f := xxhbloom.NewWithEstimates(1000, 0.01)
 	key := []byte("hello-world")

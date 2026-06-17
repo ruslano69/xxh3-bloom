@@ -39,9 +39,10 @@ func main() {
 		fail("reading %s: %v", in, err)
 	}
 
-	if srcVersion == 3 {
-		fmt.Printf("%s is already v3 (bits=%d, k=%d, seed=%#x) — rewriting anyway\n",
-			in, f.Cap(), f.K(), f.Seed())
+	// WriteTo emits v3 for XXH3 filters, v4 otherwise.
+	dstVersion := 3
+	if f.Hash() != bloom.XXH3 {
+		dstVersion = 4
 	}
 
 	fout, err := os.Create(out)
@@ -52,8 +53,8 @@ func main() {
 	must(w.Flush())
 	must(fout.Close())
 
-	fmt.Printf("converted %s (v%d) -> %s (v3): bits=%d, k=%d, seed=%#x, %d bytes\n",
-		in, srcVersion, out, f.Cap(), f.K(), f.Seed(), n)
+	fmt.Printf("converted %s (v%d) -> %s (v%d): bits=%d, k=%d, seed=%#x, hash=%s, %d bytes\n",
+		in, srcVersion, out, dstVersion, f.Cap(), f.K(), f.Seed(), f.Hash(), n)
 }
 
 func must(err error) {

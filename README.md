@@ -83,15 +83,29 @@ b := bloom.NewBlocked(1_000_000, 0.01)
 // Cache-local + exact FP (you have spare RAM)
 t := bloom.NewBlockedTuned(1_000_000, 0.01)
 
-// Keyed against untrusted input (see Security below)
+// Configured with options (seed, hash)
 seed := bloom.RandomSeed()                 // crypto-random, keep it secret
-s := bloom.NewBlockedTunedWithSeed(1_000_000, 0.01, seed)
+s := bloom.NewBlockedTuned(1_000_000, 0.01,
+    bloom.WithSeed(seed),                  // key the hash (see Security below)
+    bloom.WithHash(bloom.Murmur3),         // pick the hash function
+)
 ```
 
-Every constructor has a `*WithSeed` variant:
-`NewWithSeed`, `NewWithEstimatesAndSeed`, `NewBlockedWithSeed`,
-`NewBlockedTunedWithSeed`. Seed `0` is the default and is byte-identical to the
-unseeded filter.
+Every constructor takes variadic `Option`s — `WithSeed(seed)` and
+`WithHash(kind)` — and existing call sites without options keep working
+unchanged. (The older `*WithSeed` constructors remain as deprecated shorthands.)
+
+### Hash function
+
+The default hash is `XXH3`. `WithHash(bloom.Murmur3)` switches to MurmurHash3-128,
+and you can register your own with `RegisterHash(kind, hasher)` (kind ≥ 128). The
+chosen hash is recorded in the serialized form, so a filter always reloads with
+the hash it was built with.
+
+⚠️ **Selecting `Murmur3` matches the hash used by `bits-and-blooms/bloom`, but
+that alone does not make the filters bit-compatible** — true interop also requires
+the same location formula, bit layout, and m/k rounding. Treat `WithHash` as
+"choose the hashing primitive," not "drop-in interop with library X."
 
 Picking a tier:
 
@@ -117,16 +131,16 @@ loaded.ReadFrom(bufio.NewReader(fd2))
 ```
 
 The bit array is dumped raw via `unsafe` (no reflection — a GB-scale filter would
-take minutes through `binary.Write`). The current **v3** format is self-describing:
-it records the seed and the payload's byte order, so `WriteTo` always writes at
-host speed and `ReadFrom` byte-swaps only on the rare cross-endian load — **v3
-files are portable**. Magic bytes catch a malformed stream.
+take minutes through `binary.Write`). The format is self-describing: it records
+the seed, hash kind, and the payload's byte order, so `WriteTo` always writes at
+host speed and `ReadFrom` byte-swaps only on the rare cross-endian load — **files
+are portable**. `WriteTo` bumps the version only when a field matters: an XXH3
+filter is written as v3 (still readable by v0.3.0), a non-XXH3 filter as v4.
 
-`ReadFrom` still reads every historical version (v1 unseeded, v2 seeded, v3). To
-upgrade old files in bulk:
+`ReadFrom` reads every historical version (v1–v4). To upgrade old files in bulk:
 
 ```
-go run ./cmd/convert old.bbf new.bbf      # any version -> v3
+go run ./cmd/convert old.bbf new.bbf      # any version -> current
 ```
 
 | Format | Header | Stores | Portable |
@@ -134,6 +148,7 @@ go run ./cmd/convert old.bbf new.bbf      # any version -> v3
 | v1 (`v0.1.0`) | 24 B | numBlocks, k | no (LE only) |
 | v2 (`v0.2.0`) | 32 B | + seed | no (LE only) |
 | v3 (`v0.3.0`) | 40 B | + endianness tag | yes |
+| v4 (`v0.4.0`) | 40 B | + hash kind | yes |
 
 ## Security: hashing seed & threat model
 
@@ -196,7 +211,8 @@ the win comes from.
 ## Dependencies
 
 - [`github.com/bits-and-blooms/bitset`](https://github.com/bits-and-blooms/bitset) — bit array for the classic tier (BSD-3)
-- [`github.com/zeebo/xxh3`](https://github.com/zeebo/xxh3) — XXH3-128 (BSD-2)
+- [`github.com/zeebo/xxh3`](https://github.com/zeebo/xxh3) — XXH3-128, the default hash (BSD-2)
+- [`github.com/twmb/murmur3`](https://github.com/twmb/murmur3) — MurmurHash3-128 for `WithHash(Murmur3)` (BSD-3)
 - [`github.com/bits-and-blooms/bloom/v3`](https://github.com/bits-and-blooms/bloom) — benchmark baseline only (BSD-3)
 
 ## License
