@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"unsafe"
 
 	"github.com/zeebo/xxh3"
@@ -220,21 +221,39 @@ func (f *BlockedFilter) Seed() uint64 { return f.seed }
 
 // --- Serialization ---
 //
-// Wire format (little-endian, native byte order for the bit payload):
-//   [8] magic "BBLM\x02\x00\x00\x00"
-//   [8] numBlocks
-//   [8] k
-//   [8] seed
-//   [numBlocks*64] raw bit array (one 64-byte cache line per block)
+// The current (v3) wire format is self-describing:
+//   [8] magic   "BBLM\x03\x00\x00\x00"   (byte 4 = format version)
+//   [1] payload endianness   0 = little, 1 = big
+//   [7] reserved (zero)
+//   [8] numBlocks   (little-endian)
+//   [8] k           (little-endian)
+//   [8] seed        (little-endian)
+//   [numBlocks*64] raw bit array, one 64-byte cache line per block
 //
-// The seed is stored because a keyed filter is unusable without it. The payload
-// is dumped raw for speed (a GB-scale filter would be far too slow through
-// reflection-based binary.Write), so files are NOT portable across machines of
-// different endianness. On x86/ARM little-endian this is fine.
+// The payload is dumped raw for speed (a GB-scale filter would be far too slow
+// through reflection-based binary.Write). WriteTo always emits the host's byte
+// order and records it; ReadFrom byte-swaps on the rare cross-endian load, so
+// v3 files ARE portable — unlike v1/v2.
+//
+// ReadFrom still reads every historical format:
+//   v1 (24-byte header): magic, numBlocks, k                 — seed 0, LE payload
+//   v2 (32-byte header): magic, numBlocks, k, seed           — LE payload
+//   v3 (40-byte header): as above, with declared endianness
+// Use cmd/convert to upgrade old files to v3.
 
-const blockedHdrSize = 32
+const (
+	blockedHdrV1 = 24
+	blockedHdrV2 = 32
+	blockedHdrV3 = 40
+)
 
-var blockedMagic = [8]byte{'B', 'B', 'L', 'M', 2, 0, 0, 0}
+var blockedMagicPrefix = [4]byte{'B', 'B', 'L', 'M'}
+
+// nativeBigEndian is true on big-endian hosts.
+var nativeBigEndian = func() bool {
+	x := uint16(1)
+	return (*[2]byte)(unsafe.Pointer(&x))[0] == 0
+}()
 
 // blocksAsBytes returns a []byte view aliasing the block words — no copy.
 func blocksAsBytes(blocks []uint64) []byte {
@@ -244,14 +263,18 @@ func blocksAsBytes(blocks []uint64) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(&blocks[0])), len(blocks)*8)
 }
 
-// WriteTo writes a binary representation of the filter to w. It returns the
-// number of bytes written. Wrap w in a bufio.Writer for disk/network.
+// WriteTo writes a v3 representation of the filter to w. It returns the number
+// of bytes written. Wrap w in a bufio.Writer for disk/network.
 func (f *BlockedFilter) WriteTo(w io.Writer) (int64, error) {
-	var hdr [blockedHdrSize]byte
-	copy(hdr[0:8], blockedMagic[:])
-	binary.LittleEndian.PutUint64(hdr[8:16], f.numBlocks)
-	binary.LittleEndian.PutUint64(hdr[16:24], uint64(f.k))
-	binary.LittleEndian.PutUint64(hdr[24:32], f.seed)
+	var hdr [blockedHdrV3]byte
+	copy(hdr[0:4], blockedMagicPrefix[:])
+	hdr[4] = 3 // version
+	if nativeBigEndian {
+		hdr[8] = 1
+	}
+	binary.LittleEndian.PutUint64(hdr[16:24], f.numBlocks)
+	binary.LittleEndian.PutUint64(hdr[24:32], uint64(f.k))
+	binary.LittleEndian.PutUint64(hdr[32:40], f.seed)
 
 	n, err := w.Write(hdr[:])
 	total := int64(n)
@@ -262,35 +285,79 @@ func (f *BlockedFilter) WriteTo(w io.Writer) (int64, error) {
 	return total + int64(m), err
 }
 
-// ReadFrom reads a filter previously written by WriteTo, replacing the
+// ReadFrom reads any version (v1/v2/v3) written by this library, replacing the
 // receiver's contents. It returns the number of bytes read. Wrap r in a
 // bufio.Reader for disk/network.
 func (f *BlockedFilter) ReadFrom(r io.Reader) (int64, error) {
-	var hdr [blockedHdrSize]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+	var magic [8]byte
+	if _, err := io.ReadFull(r, magic[:]); err != nil {
 		return 0, err
 	}
-	if !bytes.Equal(hdr[0:8], blockedMagic[:]) {
-		return blockedHdrSize, fmt.Errorf("bloom: bad magic, not a blocked filter stream")
+	if !bytes.Equal(magic[0:4], blockedMagicPrefix[:]) {
+		return 8, fmt.Errorf("bloom: bad magic, not a blocked filter stream")
 	}
-	numBlocks := binary.LittleEndian.Uint64(hdr[8:16])
-	k := uint(binary.LittleEndian.Uint64(hdr[16:24]))
-	seed := binary.LittleEndian.Uint64(hdr[24:32])
+	version := magic[4]
+
+	var restSize int
+	switch version {
+	case 1:
+		restSize = blockedHdrV1 - 8
+	case 2:
+		restSize = blockedHdrV2 - 8
+	case 3:
+		restSize = blockedHdrV3 - 8
+	default:
+		return 8, fmt.Errorf("bloom: unsupported blocked format version %d", version)
+	}
+
+	rest := make([]byte, restSize)
+	if _, err := io.ReadFull(r, rest); err != nil {
+		return 8, err
+	}
+
+	var numBlocks, seed uint64
+	var k uint
+	payloadBig := false
+	switch version {
+	case 1:
+		numBlocks = binary.LittleEndian.Uint64(rest[0:8])
+		k = uint(binary.LittleEndian.Uint64(rest[8:16]))
+	case 2:
+		numBlocks = binary.LittleEndian.Uint64(rest[0:8])
+		k = uint(binary.LittleEndian.Uint64(rest[8:16]))
+		seed = binary.LittleEndian.Uint64(rest[16:24])
+	case 3:
+		payloadBig = rest[0] == 1
+		numBlocks = binary.LittleEndian.Uint64(rest[8:16])
+		k = uint(binary.LittleEndian.Uint64(rest[16:24]))
+		seed = binary.LittleEndian.Uint64(rest[24:32])
+	}
 
 	nf := newBlockedRaw(numBlocks, k, seed)
 	buf := blocksAsBytes(nf.blocks)
 	m, err := io.ReadFull(r, buf)
+	read := int64(8 + restSize + m)
 	if err != nil {
-		return int64(blockedHdrSize + m), err
+		return read, err
+	}
+	if payloadBig != nativeBigEndian {
+		swapWords(nf.blocks)
 	}
 	*f = *nf
-	return int64(blockedHdrSize + m), nil
+	return read, nil
+}
+
+// swapWords byte-reverses each 64-bit word in place (cross-endian load path).
+func swapWords(words []uint64) {
+	for i := range words {
+		words[i] = bits.ReverseBytes64(words[i])
+	}
 }
 
 // MarshalBinary implements encoding.BinaryMarshaler.
 func (f *BlockedFilter) MarshalBinary() ([]byte, error) {
 	var buf bytes.Buffer
-	buf.Grow(blockedHdrSize + len(f.blocks)*8)
+	buf.Grow(blockedHdrV3 + len(f.blocks)*8)
 	if _, err := f.WriteTo(&buf); err != nil {
 		return nil, err
 	}

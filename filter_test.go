@@ -137,7 +137,7 @@ func TestBlockedSerialization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteTo: %v", err)
 	}
-	if want := int64(32 + src.Cap()/8); n != want {
+	if want := int64(40 + src.Cap()/8); n != want {
 		t.Fatalf("WriteTo wrote %d bytes, want %d", n, want)
 	}
 
@@ -169,6 +169,65 @@ func TestBlockedSerialization(t *testing.T) {
 	if !src.Equal(&dst2) {
 		t.Fatal("MarshalBinary round-trip not equal")
 	}
+}
+
+// ReadFrom must still load legacy v1 (no seed) and v2 (with seed) files.
+func TestBlockedReadsLegacyFormats(t *testing.T) {
+	// build a populated unseeded filter and grab its raw payload (v3 blob tail)
+	mk := func(seed uint64) ([]byte, uint64, uint, uint64) {
+		f := xxhbloom.NewBlockedTunedWithSeed(5_000, 0.01, seed)
+		buf := make([]byte, 8)
+		for i := 0; i < 5_000; i++ {
+			binary.BigEndian.PutUint64(buf, uint64(i))
+			f.Add(buf)
+		}
+		v3, _ := f.MarshalBinary()
+		payload := v3[40:] // strip v3 header
+		return payload, uint64(f.Cap()) / 512, f.K(), seed
+	}
+
+	check := func(name string, blob []byte, wantSeed uint64) {
+		var f xxhbloom.BlockedFilter
+		if err := f.UnmarshalBinary(blob); err != nil {
+			t.Fatalf("%s: UnmarshalBinary: %v", name, err)
+		}
+		if f.Seed() != wantSeed {
+			t.Fatalf("%s: seed = %d, want %d", name, f.Seed(), wantSeed)
+		}
+		buf := make([]byte, 8)
+		for i := 0; i < 5_000; i++ {
+			binary.BigEndian.PutUint64(buf, uint64(i))
+			if !f.Test(buf) {
+				t.Fatalf("%s: false negative at %d after legacy load", name, i)
+			}
+		}
+	}
+
+	// v1: 24-byte header, no seed → must load with seed 0
+	payload, numBlocks, k, _ := mk(0)
+	var v1 bytes.Buffer
+	v1.Write([]byte{'B', 'B', 'L', 'M', 1, 0, 0, 0})
+	writeLE(&v1, numBlocks)
+	writeLE(&v1, uint64(k))
+	v1.Write(payload)
+	check("v1", v1.Bytes(), 0)
+
+	// v2: 32-byte header with seed
+	const seed2 = 0xDEADBEEFCAFE
+	payload, numBlocks, k, _ = mk(seed2)
+	var v2 bytes.Buffer
+	v2.Write([]byte{'B', 'B', 'L', 'M', 2, 0, 0, 0})
+	writeLE(&v2, numBlocks)
+	writeLE(&v2, uint64(k))
+	writeLE(&v2, seed2)
+	v2.Write(payload)
+	check("v2", v2.Bytes(), seed2)
+}
+
+func writeLE(buf *bytes.Buffer, v uint64) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], v)
+	buf.Write(b[:])
 }
 
 func TestBlockedSerializationBadMagic(t *testing.T) {

@@ -117,9 +117,23 @@ loaded.ReadFrom(bufio.NewReader(fd2))
 ```
 
 The bit array is dumped raw via `unsafe` (no reflection — a GB-scale filter would
-take minutes through `binary.Write`). **Caveat:** the payload is stored in native
-byte order, so files are **not portable across little/big-endian machines**. Magic
-bytes catch a malformed stream.
+take minutes through `binary.Write`). The current **v3** format is self-describing:
+it records the seed and the payload's byte order, so `WriteTo` always writes at
+host speed and `ReadFrom` byte-swaps only on the rare cross-endian load — **v3
+files are portable**. Magic bytes catch a malformed stream.
+
+`ReadFrom` still reads every historical version (v1 unseeded, v2 seeded, v3). To
+upgrade old files in bulk:
+
+```
+go run ./cmd/convert old.bbf new.bbf      # any version -> v3
+```
+
+| Format | Header | Stores | Portable |
+|---|---|---|---|
+| v1 (`v0.1.0`) | 24 B | numBlocks, k | no (LE only) |
+| v2 (`v0.2.0`) | 32 B | + seed | no (LE only) |
+| v3 (`v0.3.0`) | 40 B | + endianness tag | yes |
 
 ## Security: hashing seed & threat model
 
