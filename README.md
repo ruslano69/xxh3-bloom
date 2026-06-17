@@ -6,9 +6,10 @@ the hash function. API-compatible with
 
 At its core this is a **low-level optimization of the membership-lookup algorithm**:
 the same Bloom filter, but with its bits laid out for the CPU cache. The library
-ships one such layout (scalar blocked); the broader family — SIMD register-blocking,
-256- vs 512-bit blocks, AVX2 vs AVX-512 — is explored in
-[Cache-line strategies](#cache-line-strategies-research-in-benchrust).
+ships two such layouts — scalar blocked (512-bit) and SIMD split-block (256-bit,
+AVX2) — out of the broader family explored in
+[Cache-line strategies](#cache-line-strategies-research-in-benchrust):
+512- vs 256-bit blocks, AVX2 vs AVX-512.
 
 > **The honest one-liner:** the lookup speedup (~2.9×) comes from
 > **single-cache-line probing**, not from the choice of hash. XXH3 is an
@@ -21,6 +22,8 @@ ships one such layout (scalar blocked); the broader family — SIMD register-blo
 | `Filter` | [`filter.go`](filter.go) | Classic filter, XXH3 drop-in instead of MurmurHash3 |
 | `BlockedFilter` | [`filter_blocked.go`](filter_blocked.go) | All `k` bits of a key live in one 64-byte cache line → 1 cache miss instead of `k` |
 | `NewBlockedTuned` | [`filter_blocked.go`](filter_blocked.go) | Same, but the block count is numerically sized to hit the target FP (spend ~10% more RAM, get the accuracy back) |
+| `SimdFilter` | [`filter_simd.go`](filter_simd.go) | Split-block 256-bit (½ cache line, k=8 fixed): the membership test is ~5 AVX2 instructions. Fastest query path in the library |
+| `NewSimdTuned` | [`filter_simd.go`](filter_simd.go) | Same, block count sized to hit the target FP (~15% more RAM — the price of the split-block layout) |
 
 ## Where the speed comes from (and where it doesn't)
 
@@ -76,9 +79,13 @@ The batch path widens it further. On a 20M-key out-of-cache query
 | `bits-and-blooms` `Test` loop | 144 | 1× |
 | Blocked `Test` loop | 33.9 | 4.2× |
 | **Blocked `TestBatch`** | **14.3** | **~10×** |
+| **Simd `TestBatch`** | **12.8** | **~11×** |
 
 Prefetch + memory-level parallelism turns the single-cache-line layout into a ~2.4×
-gain over the already-fast scalar blocked loop.
+gain over the already-fast scalar blocked loop. Layering the **SIMD split-block**
+filter on top — half-cache-line blocks plus a ~5-instruction AVX2 probe — shaves
+another ~11% off (12.8 vs 14.3 ns, ranges disjoint under `benchstat`), making
+`SimdFilter.TestBatch` the fastest query path the library offers.
 
 ## The "convenient property" of XXH3 we rely on
 
@@ -127,6 +134,12 @@ b := bloom.NewBlocked(1_000_000, 0.01)
 // Cache-local + exact FP (you have spare RAM)
 t := bloom.NewBlockedTuned(1_000_000, 0.01)
 
+// Fastest query path (SIMD split-block, AVX2 where available, else scalar)
+sf := bloom.NewSimd(1_000_000, 0.01)
+sf.AddBatch(keys)             // batch fill/lookup is where it shines
+sf.TestBatch(keys, out)
+st := bloom.NewSimdTuned(1_000_000, 0.01)  // + ~15% RAM to hit the FP target
+
 // Configured with options (seed, hash)
 seed := bloom.RandomSeed()                 // crypto-random, keep it secret
 s := bloom.NewBlockedTuned(1_000_000, 0.01,
@@ -164,7 +177,15 @@ Picking a tier (by resources):
 Memory-constrained, accuracy critical   → Filter (classic)
 Have RAM, need throughput               → NewBlockedTuned
 Accuracy not critical, want raw speed   → NewBlocked
+Bulk lookups, want the fastest query    → NewSimd + TestBatch  (amd64/AVX2)
 ```
+
+`SimdFilter` is the speed ceiling but the least flexible tier: `k` is fixed at 8
+(one bit per 32-bit lane), it has **no serialization** (rebuild from source on
+restart), and its accuracy tradeoff is slightly worse than the scalar blocked
+filter (the split-block layout, below). Reach for it when bulk throughput is the
+goal and the keys are regenerable; otherwise the blocked tiers are the safer
+default.
 
 ### Choosing by trust boundary
 
@@ -229,10 +250,10 @@ filters must be **regenerated from source data**.
 | v5 (`v0.7.0`) | 40 B | endianness, hash kind, seed | readable (loads as modulo) |
 | v6 (current) | 40 B | + block-index mode (modulo/fastrange) | current, portable |
 
-### Batch API (blocked tiers only)
+### Batch API (blocked and SIMD tiers)
 
 For bulk insert/lookup, `AddBatch`/`TestBatch` beat a loop of `Add`/`Test` once
-the filter spills out of cache:
+the filter spills out of cache (both `BlockedFilter` and `SimdFilter` expose them):
 
 ```go
 keys := [][]byte{key0, key1, key2 /* … */}
@@ -368,18 +389,45 @@ real but not order-of-magnitude, and smallest on the memory-bound query paths.
 
 ## Cache-line strategies (research, in `bench/rust`)
 
-The Go library above ships one cache-aware layout: the scalar **blocked** filter,
-where a key's `k` bits live in one 64-byte line (1 cache miss). But "one cache
+The Go library ships two cache-aware layouts: the scalar **blocked** filter (512-bit
+line, 1 miss) and the **SIMD split-block** `simd` (256-bit, AVX2). But "one cache
 line" is not a single design — it's a small **family of layouts** trading speed,
-accuracy, and how much of the line you use. We explored that family in Rust
-(easier to drop to intrinsics); these are **experiments, not part of the Go API yet**:
+accuracy, and how much of the line you use. We explored the rest of that family in
+Rust (easier to drop to intrinsics); the `simd512`/`avx512` modes below are
+**Rust-only experiments, not in the Go API**:
 
 | Layout | Block | Cache miss | Mask build | Notes |
 |---|---|---|---|---|
-| scalar blocked | 512-bit | 1 | — | what the Go library ships |
-| SIMD split-block (`simd`) | 256-bit (½ line) | 1 | vector (`mullo_epi32`) | fastest; FP a bit higher |
-| SIMD split-block (`simd512`) | 512-bit (1 line) | 1 | **scalar** (AVX2 has no `mullo_epi64`) | scalar-blocked accuracy, faster fill |
-| SIMD split-block (`avx512`) | 512-bit (1 line) | 1 | **vector** (`mullo_epi64`, AVX-512DQ) | full-line block, mask built in one register |
+| scalar blocked | 512-bit | 1 | — | Go: `BlockedFilter` |
+| SIMD split-block (`simd`) | 256-bit (½ line) | 1 | vector (`mullo_epi32`) | Go: `SimdFilter` (AVX2). Fastest; FP a bit higher |
+| SIMD split-block (`simd512`) | 512-bit (1 line) | 1 | **scalar** (AVX2 has no `mullo_epi64`) | Rust only. Scalar-blocked accuracy, faster fill |
+| SIMD split-block (`avx512`) | 512-bit (1 line) | 1 | **vector** (`mullo_epi64`, AVX-512DQ) | Rust only. Full-line block, mask built in one register |
+
+### The Go `SimdFilter`: layout, accuracy, and the AVX2 path
+
+The Go `SimdFilter` is the `simd` row above, ported to a hand-written AVX2 stub
+([`simd_amd64.s`](simd_amd64.s)) with a scalar fallback for non-amd64. A 256-bit
+block is 8 lanes of 32 bits with **exactly one bit set per lane**, so `k` is fixed
+at 8: one `xxh3.Hash128` picks the block (`Hi % numBlocks`), and the low 32 bits
+seed all 8 lane positions (`idx = (key32 * salt[lane]) >> 27`). The whole probe is
+~5 AVX2 instructions (`VPMULLD`/`VPSRLD`/`VPSLLVD` to build the mask, then `VPANDN`
++ `VPTEST` to test containment). A bit-exactness test asserts the AVX2 path lays down
+**byte-for-byte the same blocks** as the scalar reference.
+
+The split-block layout trades a little accuracy for that speed. One-bit-per-lane
+constrains where bits can land, so for equal memory the false-positive rate runs a
+touch hotter than the scalar blocked filter:
+
+| Tier | Mem vs plain | Measured FP (1% target) |
+|---|---|---|
+| `NewSimd` (plain) | baseline | ~1.5 % ⚠️ |
+| `NewSimd` +10% blocks | +10 % | ~1.0 % |
+| `NewSimdTuned` | +~15 % | **0.81 %** ✅ |
+
+`NewSimdTuned` sizes the block count to hit the target (vs ~10% for the scalar
+`NewBlockedTuned` — the extra ~5% is the price of the split-block layout). Use
+plain `NewSimd` when a ~1.5% rate is fine and you want the memory; tuned when you
+need the target FP and have the RAM.
 
 Measured on Intel i7-7700 (AVX2), 200M elements, same memory:
 
@@ -400,6 +448,25 @@ whole 512-bit line's mask in one register (`_mm512_mullo_epi64` + `sllv`), where
 AVX2's `simd512` had to fall back to scalar. On a 128-byte-cache-line CPU (Apple
 Silicon) the block-vs-line ratio shifts again.
 See [`bench/rust/README.md`](bench/rust/README.md) for the full tradeoff triangle.
+
+### Honest Go vs Rust on the SIMD path
+
+Both implementations lay out identical bits, so this isolates the language/codegen
+gap on the *same* Ryzen 9 7900X at 50M elements (out of L3):
+
+| Path | Go (`SimdFilter`) | Rust (`simd`) | Gap |
+|---|---|---|---|
+| single-op query | 45 ns | 22 ns | ~2× Rust |
+| batch query (prefetch window 32) | 14.5 ns | **8.0 ns** | ~1.8× Rust |
+
+Two honest takeaways. First, **Go's batch path (14.5 ns) beats Rust's single-op
+query (22 ns)** — but only because the prefetch+MLP structure does the heavy
+lifting; it's an algorithmic win, not a codegen one. Second, once *both* sides
+batch, the **~2× per-op gap carries straight into the batch regime** (8.0 vs 14.5):
+Rust's tighter codegen on the AVX2 inner loop is the residual difference. The Go
+filter is the fastest thing *this library* offers; Rust at an identical algorithm
+is still ~1.8–2× ahead, consistent with the ~1.2–1.6× language gap seen on the
+scalar paths, widened by the hand-tuned intrinsics.
 
 ## Origin of the idea
 
