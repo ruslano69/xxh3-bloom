@@ -118,26 +118,36 @@ struct BlockedXXH3 {
     off: usize,
     num_blocks: u64,
     k: u32,
+    fastrange: bool, // true: (hi*N)>>64 (Lemire) instead of hi % N (a 64-bit DIV)
 }
 impl BlockedXXH3 {
     fn new(n: usize, fp: f64) -> Self {
+        Self::with_range(n, fp, false)
+    }
+    fn with_range(n: usize, fp: f64, fastrange: bool) -> Self {
         let (m, k) = estimate(n, fp);
         let num_blocks = ((m as f64) / BLOCK_BITS as f64).ceil() as u64;
-        Self::raw(num_blocks.max(1), k.max(1))
+        Self::raw(num_blocks.max(1), k.max(1), fastrange)
     }
-    fn raw(num_blocks: u64, k: u32) -> Self {
+    fn raw(num_blocks: u64, k: u32, fastrange: bool) -> Self {
         let words = num_blocks as usize * BLOCK_WORDS;
         let backing = vec![0u64; words + BLOCK_WORDS]; // 64B slack for alignment
         let addr = backing.as_ptr() as usize;
         let off = ((64 - (addr & 63)) & 63) / 8; // offset to next 64-byte boundary, in u64 units
-        BlockedXXH3 { backing, off, num_blocks, k }
+        BlockedXXH3 { backing, off, num_blocks, k, fastrange }
     }
     #[inline]
     fn block_off(&self, key: u64) -> (usize, u32, u32) {
         let h = xxh3_128(&key.to_le_bytes());
         let hi = (h >> 64) as u64;
         let lo = h as u64;
-        let block = (hi % self.num_blocks) as usize;
+        // Map hi into [0, num_blocks): modulo is a true 64-bit DIV on the critical
+        // path before the load; fastrange is a single widening multiply + shift.
+        let block = if self.fastrange {
+            ((hi as u128 * self.num_blocks as u128) >> 64) as usize
+        } else {
+            (hi % self.num_blocks) as usize
+        };
         // odd stride for enhanced double hashing (matches the Go library)
         (self.off + block * BLOCK_WORDS, lo as u32, ((lo >> 32) as u32) | 1)
     }
@@ -383,6 +393,10 @@ fn main() {
         "classic" => (
             "Rust classic (our XXH3 scheme)",
             Box::new(ClassicXXH3::new(capacity as usize, fp_rate)),
+        ),
+        "blocked-fr" => (
+            "Rust blocked (XXH3, fastrange block index)",
+            Box::new(BlockedXXH3::with_range(capacity as usize, fp_rate, true)),
         ),
         #[cfg(target_arch = "x86_64")]
         "simd" => (
