@@ -51,19 +51,53 @@ On *small* filters (those that fit in L3, < ~700K elements at 1% FP) XXH3 really
 a bit faster than Murmur3 (~10–15 % on short keys), because there computation
 dominates rather than memory. That shows up in the micro-benchmarks.
 
+### Head-to-head vs `bits-and-blooms`
+
+A fresh run on a Ryzen 9 7900X (Zen 4), 50M elements, 100% fill, 10M queries, FP
+target 1% (`go run ./cmd/e2e -capacity 50000000 -fill 100 -queries 10000000
+-compare -blocked -tuned`):
+
+| Tier | Fill ns | Query TP ns | Query TN ns | FP rate |
+|---|---|---|---|---|
+| `bits-and-blooms` (Murmur3) | 160 | 144 | 150 | 1.00 % |
+| classic `Filter` (XXH3) | 153 | 138 | 144 | 1.00 % |
+| **Blocked-XXH3** | **53** | **50** | **56** | 1.22 % ⚠️ |
+| **Blocked-Tuned** | **54** | **53** | **57** | **0.81 %** ✅ |
+
+Same story as the older box, larger margin: the blocked tiers are **~2.7× faster**
+than `bits-and-blooms` on the query path, at the cost of accuracy (plain) or +10%
+memory (tuned). Classic XXH3 vs Murmur3 is a wash, as expected.
+
+The batch path widens it further. On a 20M-key out-of-cache query
+(`BenchmarkBlockedTestBatch` vs `BenchmarkBlockedTestLoop`):
+
+| Path | ns/op | vs library |
+|---|---|---|
+| `bits-and-blooms` `Test` loop | 144 | 1× |
+| Blocked `Test` loop | 33.9 | 4.2× |
+| **Blocked `TestBatch`** | **14.3** | **~10×** |
+
+Prefetch + memory-level parallelism turns the single-cache-line layout into a ~2.4×
+gain over the already-fast scalar blocked loop.
+
 ## The "convenient property" of XXH3 we rely on
 
 Not speed. We rely on the fact that **a single alloc-free `xxh3.Hash128` call hands
 back exactly the shape of data a blocked filter needs**:
 
 ```go
-h := xxh3.Hash128(data)        // one call, zero allocations, 128 bits
-blockIdx := h.Hi % numBlocks   // high 64 bits → pick the cache line
-a := uint32(h.Lo)              // low 64 bits, lower half
-b := uint32(h.Lo>>32) | 1      //              upper half (odd stride)
+h := xxh3.Hash128(data)            // one call, zero allocations, 128 bits
+blockIdx, _ := bits.Mul64(h.Hi, numBlocks) // high 64 bits → cache line (fastrange)
+a := uint32(h.Lo)                  // low 64 bits, lower half
+b := uint32(h.Lo>>32) | 1          //              upper half (odd stride)
 // k positions inside the block via enhanced double hashing (Dillinger-Manolios):
 //   bit_i = a & 511; then a += b; b += i
 ```
+
+The block index uses **fastrange** (Lemire): `(h.Hi * n) >> 64` via a single
+widening multiply, replacing a 64-bit modulo on the hot path. It maps the hash
+uniformly onto `[0, numBlocks)` without requiring the block count to be a power of
+two — so it stays free to be the tuned value, not the next power of two up.
 
 So from one hash we get both the **block index** and the two seeds for the in-block
 probe sequence for free — no second pass over the data, no heap. The classic
@@ -172,13 +206,19 @@ loaded.ReadFrom(bufio.NewReader(fd2))
 ```
 
 The bit array is dumped raw via `unsafe` (no reflection — a GB-scale filter would
-take minutes through `binary.Write`). The current format **v5** is self-describing:
-it records the seed, hash kind, and the payload's byte order, so `WriteTo` always
-writes at host speed and `ReadFrom` byte-swaps only on the rare cross-endian load
-— **v5 files are portable**.
+take minutes through `binary.Write`). The current format **v6** is self-describing:
+it records the seed, hash kind, the **block-index mode** (modulo vs fastrange), and
+the payload's byte order, so `WriteTo` always writes at host speed and `ReadFrom`
+byte-swaps only on the rare cross-endian load — **v6 files are portable**.
+
+The block-index mode is stored because the on-disk bit layout depends on it: the
+reader must pick blocks with the same function used at write time. New filters
+default to **fastrange** (a widening multiply + shift instead of a 64-bit modulo).
+**v5 files still load** — their (previously reserved) mode byte is zero, which
+reads as modulo, exactly how v5 filters were built.
 
 ⚠️ **Formats v1–v4 (`≤ v0.6.0`) are rejected.** They used a flawed in-block probe
-scheme with a different bit layout (see below); reinterpreting them under v5 would
+scheme with a different bit layout (see below); reinterpreting them would
 produce false negatives, so `ReadFrom` refuses them with a clear error rather than
 silently corrupting results. A Bloom filter can't be rebuilt from its bits, so such
 filters must be **regenerated from source data**.
@@ -186,7 +226,31 @@ filters must be **regenerated from source data**.
 | Format | Header | Stores | Status |
 |---|---|---|---|
 | v1–v4 (`≤ v0.6.0`) | 24–40 B | — | **rejected** (incompatible probe scheme) |
-| v5 (`v0.7.0`) | 40 B | endianness, hash kind, seed | current, portable |
+| v5 (`v0.7.0`) | 40 B | endianness, hash kind, seed | readable (loads as modulo) |
+| v6 (current) | 40 B | + block-index mode (modulo/fastrange) | current, portable |
+
+### Batch API (blocked tiers only)
+
+For bulk insert/lookup, `AddBatch`/`TestBatch` beat a loop of `Add`/`Test` once
+the filter spills out of cache:
+
+```go
+keys := [][]byte{key0, key1, key2 /* … */}
+f.AddBatch(keys)
+
+out := make([]bool, len(keys))
+f.TestBatch(keys, out)         // out[i] is the answer for keys[i]
+```
+
+They process keys in a small window: first hash every key in the window and
+**software-prefetch** its cache line, then run the k-probes. Issuing the
+prefetches before the dependent loads keeps several cache misses in flight at once
+(memory-level parallelism) instead of one strictly serial miss per lookup. The bit
+layout is identical to the scalar path — `AddBatch` lays down exactly the bits an
+`Add` loop would. The prefetch hint is a `PREFETCHT0` stub on `amd64`; other
+architectures fall back to the two-phase structure alone (still some MLP via
+out-of-order execution). Measured ~2.4× on a 20M-key out-of-cache query
+(see the table below).
 
 ## Security: hashing seed & threat model
 
@@ -315,6 +379,7 @@ accuracy, and how much of the line you use. We explored that family in Rust
 | scalar blocked | 512-bit | 1 | — | what the Go library ships |
 | SIMD split-block (`simd`) | 256-bit (½ line) | 1 | vector (`mullo_epi32`) | fastest; FP a bit higher |
 | SIMD split-block (`simd512`) | 512-bit (1 line) | 1 | **scalar** (AVX2 has no `mullo_epi64`) | scalar-blocked accuracy, faster fill |
+| SIMD split-block (`avx512`) | 512-bit (1 line) | 1 | **vector** (`mullo_epi64`, AVX-512DQ) | full-line block, mask built in one register |
 
 Measured on Intel i7-7700 (AVX2), 200M elements, same memory:
 
@@ -329,8 +394,11 @@ CPU work but lookups only get ~25 % faster — because the query path is
 **memory-latency-bound**, so the saved compute hides behind the cache miss. SIMD's
 big win lands on the throughput-bound **fill** path instead (2.5×). And the layout
 is **platform-bound**: 256-bit blocks vectorize the mask cleanly on AVX2, but a
-full-line 512-bit block can't (no 64-bit-lane multiply until AVX-512, e.g. Zen 4).
-On a 128-byte-cache-line CPU (Apple Silicon) the block-vs-line ratio shifts again.
+full-line 512-bit block needs a 64-bit-lane multiply — `mullo_epi64`, which arrives
+only with AVX-512DQ (e.g. Zen 4). The `avx512` mode does exactly that: it builds the
+whole 512-bit line's mask in one register (`_mm512_mullo_epi64` + `sllv`), where
+AVX2's `simd512` had to fall back to scalar. On a 128-byte-cache-line CPU (Apple
+Silicon) the block-vs-line ratio shifts again.
 See [`bench/rust/README.md`](bench/rust/README.md) for the full tradeoff triangle.
 
 ## Origin of the idea
