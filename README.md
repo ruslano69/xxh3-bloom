@@ -125,6 +125,12 @@ go run ./cmd/e2e/ -capacity 200000000 -fill 100 -blocked -tuned
 Harness flags: `-capacity`, `-fill` (%), `-fp`, `-queries`, `-compare` (add
 Murmur3), `-blocked`, `-tuned`.
 
+A Rust cross-check that ports the same filters (to isolate language from
+hash/algorithm, and to compare against the SipHash-based `bloomfilter` crate)
+lives in [`bench/rust`](bench/rust). The false-positive counts match Go
+bit-for-bit, and at an identical hash+algorithm Rust comes out ~1.2–1.6× ahead —
+real but not order-of-magnitude, and smallest on the memory-bound query paths.
+
 ## Origin of the idea
 
 The blocked Bloom filter is a well-known class, not our invention: see

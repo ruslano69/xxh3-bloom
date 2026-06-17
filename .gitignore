@@ -5,3 +5,6 @@
 
 # serialized filters produced by the e2e/demo runs
 *.bbf
+
+# Rust build artifacts (bench/rust)
+target/
