@@ -82,7 +82,16 @@ b := bloom.NewBlocked(1_000_000, 0.01)
 
 // Cache-local + exact FP (you have spare RAM)
 t := bloom.NewBlockedTuned(1_000_000, 0.01)
+
+// Keyed against untrusted input (see Security below)
+seed := bloom.RandomSeed()                 // crypto-random, keep it secret
+s := bloom.NewBlockedTunedWithSeed(1_000_000, 0.01, seed)
 ```
+
+Every constructor has a `*WithSeed` variant:
+`NewWithSeed`, `NewWithEstimatesAndSeed`, `NewBlockedWithSeed`,
+`NewBlockedTunedWithSeed`. Seed `0` is the default and is byte-identical to the
+unseeded filter.
 
 Picking a tier:
 
@@ -111,6 +120,37 @@ The bit array is dumped raw via `unsafe` (no reflection — a GB-scale filter wo
 take minutes through `binary.Write`). **Caveat:** the payload is stored in native
 byte order, so files are **not portable across little/big-endian machines**. Magic
 bytes catch a malformed stream.
+
+## Security: hashing seed & threat model
+
+XXH3, like MurmurHash3, is a **fast, non-cryptographic** hash with a fixed,
+publicly known mapping. That's perfect for trusted data but has one consequence
+worth understanding.
+
+**Bloom filters are immune to classic hash-flooding** (the O(n²) hash-table
+blow-up): every op is a fixed `O(k)` regardless of input, so you cannot make the
+CPU collide its way to a stall. But there is a related attack — **filter
+poisoning**: an attacker who knows your fixed hash can craft inputs that
+maximize false positives (making the filter pass everything and stop protecting
+the backend), or, for a blocked filter, saturate one specific cache line.
+
+The mitigation is to turn XXH3 into a **keyed** hash with a secret per-process
+seed (`RandomSeed()` + a `*WithSeed` constructor). Without the seed an attacker
+can no longer precompute colliding inputs offline — which removes the vast
+majority of the incentive to attack.
+
+```
+Keys are YOUR data (file paths, internal IDs you generate)   → unseeded is fine
+Keys come from untrusted users who benefit from poisoning    → use *WithSeed
+```
+
+⚠️ **Caveat — not a MAC.** XXH3 with a seed is *not* a proven cryptographic
+primitive the way SipHash (used by the `bloomfilter` crate, and by Rust/Python
+hash maps) or HMAC is. Seeding defeats offline precomputation, which covers the
+practical threat, but against a determined adversary who can mount adaptive
+online attacks, prefer a keyed cryptographic hash. This is the same speed ↔
+abuse-resistance tradeoff measured in [`bench/rust`](bench/rust): SipHash costs
+~1.8× to buy a stronger guarantee.
 
 ## Reproduce the benchmarks
 

@@ -137,7 +137,7 @@ func TestBlockedSerialization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteTo: %v", err)
 	}
-	if want := int64(24 + src.Cap()/8); n != want {
+	if want := int64(32 + src.Cap()/8); n != want {
 		t.Fatalf("WriteTo wrote %d bytes, want %d", n, want)
 	}
 
@@ -176,6 +176,88 @@ func TestBlockedSerializationBadMagic(t *testing.T) {
 	err := f.UnmarshalBinary([]byte("not a real filter blob................"))
 	if err == nil {
 		t.Fatal("expected error on bad magic, got nil")
+	}
+}
+
+func TestSeededNoFalseNegatives(t *testing.T) {
+	seed := xxhbloom.RandomSeed()
+	classic := xxhbloom.NewWithEstimatesAndSeed(20_000, 0.01, seed)
+	blocked := xxhbloom.NewBlockedTunedWithSeed(20_000, 0.01, seed)
+	buf := make([]byte, 8)
+	for i := 0; i < 20_000; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		classic.Add(buf)
+		blocked.Add(buf)
+	}
+	for i := 0; i < 20_000; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		if !classic.Test(buf) {
+			t.Fatalf("seeded classic false negative at %d", i)
+		}
+		if !blocked.Test(buf) {
+			t.Fatalf("seeded blocked false negative at %d", i)
+		}
+	}
+	if classic.Seed() != seed || blocked.Seed() != seed {
+		t.Fatal("Seed() did not report the configured seed")
+	}
+}
+
+// Different seeds must produce different bit patterns for the same keys —
+// that's exactly what defeats an attacker's precomputed collisions.
+func TestSeedChangesBits(t *testing.T) {
+	a := xxhbloom.NewBlockedWithSeed(10_000, 0.01, 1)
+	b := xxhbloom.NewBlockedWithSeed(10_000, 0.01, 2)
+	buf := make([]byte, 8)
+	for i := 0; i < 10_000; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		a.Add(buf)
+		b.Add(buf)
+	}
+	if a.Equal(b) {
+		t.Fatal("filters with different seeds produced identical bits")
+	}
+	// seed 0 must reproduce the unseeded scheme exactly
+	u1 := xxhbloom.NewBlocked(10_000, 0.01)
+	u2 := xxhbloom.NewBlockedWithSeed(10_000, 0.01, 0)
+	for i := 0; i < 10_000; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		u1.Add(buf)
+		u2.Add(buf)
+	}
+	if !u1.Equal(u2) {
+		t.Fatal("seed 0 should equal the unseeded filter")
+	}
+}
+
+func TestSeededSerializationRoundTrip(t *testing.T) {
+	seed := xxhbloom.RandomSeed()
+	src := xxhbloom.NewBlockedTunedWithSeed(30_000, 0.01, seed)
+	buf := make([]byte, 8)
+	for i := 0; i < 30_000; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		src.Add(buf)
+	}
+	blob, err := src.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+	var dst xxhbloom.BlockedFilter
+	if err := dst.UnmarshalBinary(blob); err != nil {
+		t.Fatalf("UnmarshalBinary: %v", err)
+	}
+	if dst.Seed() != seed {
+		t.Fatalf("seed not preserved: got %d, want %d", dst.Seed(), seed)
+	}
+	if !src.Equal(&dst) {
+		t.Fatal("seeded round-trip not equal")
+	}
+	// keys must still test positive — proves the reloaded seed actually hashes right
+	for i := 0; i < 30_000; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		if !dst.Test(buf) {
+			t.Fatalf("false negative after seeded reload at %d", i)
+		}
 	}
 }
 
