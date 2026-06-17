@@ -5,7 +5,10 @@ the hash function. API-compatible with
 [`bits-and-blooms/bloom`](https://github.com/bits-and-blooms/bloom).
 
 At its core this is a **low-level optimization of the membership-lookup algorithm**:
-the same Bloom filter, but with its bits laid out for the CPU cache.
+the same Bloom filter, but with its bits laid out for the CPU cache. The library
+ships one such layout (scalar blocked); the broader family — SIMD register-blocking,
+256- vs 512-bit blocks, AVX2 vs AVX-512 — is explored in
+[Cache-line strategies](#cache-line-strategies-research-in-benchrust).
 
 > **The honest one-liner:** the lookup speedup (~2.9×) comes from
 > **single-cache-line probing**, not from the choice of hash. XXH3 is an
@@ -228,6 +231,58 @@ cache-penetration flood, against an embedded miniredis (no Docker) — lives in
 [`examples/cache-penetration`](examples/cache-penetration). It blocks 99.7% of a
 500k-key attack before it leaves the process.
 
+## Applications & caveats
+
+The filter fits one shape of problem well: an **in-memory pre-filter in front of an
+expensive resource** (a DB behind a cache, a backend behind a proxy) at high RPS,
+where a `~140 ns` check saves a `µs`-scale network/disk trip for keys that are
+provably absent. The runnable Redis example is in
+[`examples/cache-penetration`](examples/cache-penetration). But the failure modes
+decide whether it helps or hurts:
+
+- **Direction of the false positive matters.** Use it as a **fail-open whitelist**
+  (not in the set → take the cheap path / return absent): a FP only ever costs a
+  wasted lookup, never a wrong "no". The inverse — a **blacklist that drops on a
+  hit** — is dangerous: a FP there silently blocks a *legitimate* user. If you must
+  block on presence, follow a `true` with an exact check.
+- **`Test` is concurrency-safe only when nothing is calling `Add`.** Reads race
+  against the in-place `|=` of a write. Load-once-then-read-only is fine; a filter
+  updated live under traffic needs an external lock or an atomic pointer swap
+  (build a new filter, swap it in). The filter has **no internal locking**.
+- **No deletion.** You cannot remove a key — a changing set (un-bans, expiring
+  entries) means rebuilding the filter, or using a counting/cuckoo filter instead.
+- **Attacker-chosen keys → `Secured`.** If keys come from outside, a known fixed
+  hash lets an attacker craft inputs that saturate one block and drive its FP up,
+  defeating the guard. `Secured(RandomSeed())` (SipHash + secret seed) makes those
+  collisions unpredictable. This is the same defense Redis itself uses (see below).
+- **`140 ns` is single-op latency, not throughput.** High RPS comes from running
+  reads concurrently across cores (safe, per the point above).
+
+### The other profile: certificate revocation (size-bound, not speed-bound)
+
+The most famous Bloom deployment — [CRLite](https://blog.mozilla.org/security/2020/01/09/crlite-part-3-speeding-up-secure-browsing/)
+in Firefox — is the *opposite* of the cache case, and worth calling out because it
+flips the tier choice:
+
+- **Bloom's no-false-negatives is exactly the safety property here.** The set is
+  *revoked* certs; a revoked cert is therefore **never missed**. The cost is the
+  inverse FP — a valid cert wrongly flagged revoked — which is an *availability*
+  cost, not a security hole.
+- **Drive FP to zero with a Bloom filter cascade.** Because the universe of certs is
+  known and closed (Certificate Transparency logs), CRLite layers filters: level 0
+  holds the revoked set, its false positives over the valid set go into level 1,
+  *its* false positives into level 2, and so on until none remain — **zero FP and
+  zero FN over the enrolled universe**. (Over an *open* set of arbitrary queries the
+  cascade gives no such guarantee.)
+- **For this, use the classic `Filter`, not the blocked tiers.** Revocation is
+  **size-bound** (the filter is shipped to many clients and queried rarely), the
+  opposite of high-RPS lookup. The blocked/SIMD tiers trade memory for speed —
+  the wrong trade here; minimum memory wins. `Secured` is also unnecessary: certs
+  are CA-signed, so queries can't be crafted to poison a block.
+- This library ships a **single** filter — a cascade is a layer you'd build on top
+  of several of them; we don't provide it (yet). "Load once, read-only, rebuild each
+  period" matches how a CRL is reissued, so the no-deletion limit is a non-issue.
+
 ## Reproduce the benchmarks
 
 ```bash
@@ -246,6 +301,37 @@ hash/algorithm, and to compare against the SipHash-based `bloomfilter` crate)
 lives in [`bench/rust`](bench/rust). The false-positive counts match Go
 bit-for-bit, and at an identical hash+algorithm Rust comes out ~1.2–1.6× ahead —
 real but not order-of-magnitude, and smallest on the memory-bound query paths.
+
+## Cache-line strategies (research, in `bench/rust`)
+
+The Go library above ships one cache-aware layout: the scalar **blocked** filter,
+where a key's `k` bits live in one 64-byte line (1 cache miss). But "one cache
+line" is not a single design — it's a small **family of layouts** trading speed,
+accuracy, and how much of the line you use. We explored that family in Rust
+(easier to drop to intrinsics); these are **experiments, not part of the Go API yet**:
+
+| Layout | Block | Cache miss | Mask build | Notes |
+|---|---|---|---|---|
+| scalar blocked | 512-bit | 1 | — | what the Go library ships |
+| SIMD split-block (`simd`) | 256-bit (½ line) | 1 | vector (`mullo_epi32`) | fastest; FP a bit higher |
+| SIMD split-block (`simd512`) | 512-bit (1 line) | 1 | **scalar** (AVX2 has no `mullo_epi64`) | scalar-blocked accuracy, faster fill |
+
+Measured on Intel i7-7700 (AVX2), 200M elements, same memory:
+
+| Layout | Fill ns/op | Query TP ns | FP |
+|---|---|---|---|
+| `simd` (256-bit) | **51** | **62** | 1.52 % |
+| `simd512` (512-bit) | 70 | 74 | 1.28 % |
+| scalar blocked | 129 | 78 | 1.23 % |
+
+The lesson is the project thesis, sharpened: SIMD removes ~85 % of the per-lookup
+CPU work but lookups only get ~25 % faster — because the query path is
+**memory-latency-bound**, so the saved compute hides behind the cache miss. SIMD's
+big win lands on the throughput-bound **fill** path instead (2.5×). And the layout
+is **platform-bound**: 256-bit blocks vectorize the mask cleanly on AVX2, but a
+full-line 512-bit block can't (no 64-bit-lane multiply until AVX-512, e.g. Zen 4).
+On a 128-byte-cache-line CPU (Apple Silicon) the block-vs-line ratio shifts again.
+See [`bench/rust/README.md`](bench/rust/README.md) for the full tradeoff triangle.
 
 ## Origin of the idea
 

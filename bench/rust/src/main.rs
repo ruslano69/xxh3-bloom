@@ -15,6 +15,9 @@ use bloomfilter::Bloom;
 use std::time::Instant;
 use xxhash_rust::xxh3::{xxh3_128, xxh3_128_with_seed};
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 const BLOCK_BITS: u64 = 512;
 const BLOCK_WORDS: usize = 8;
 const BLOCK_MASK: u32 = 511;
@@ -171,6 +174,196 @@ impl Filter for BlockedXXH3 {
     }
 }
 
+// ---- AVX2 split-block filter (Impala / Parquet style, register-blocked) ----
+// This is NOT our scalar blocked filter vectorized — it is the canonical SIMD
+// Bloom layout: each block is 256 bits = 8 lanes x 32 bits, and one bit is set
+// per lane. The whole k=8 membership test collapses to ~5 SIMD ops, branchless:
+//   set   -> block |= mask          (one OR + store)
+//   check -> _mm256_testc(block, mask)   (one instruction)
+// Tradeoff: one-bit-per-32-bit-word constrains placement, so FP is slightly
+// worse than a true k=8 Bloom at equal memory — we measure the real FP below.
+#[cfg(target_arch = "x86_64")]
+const SALT: [u32; 8] = [
+    0x47b6_137b, 0x4497_4d91, 0x8824_ad5b, 0xa2b7_289d,
+    0x7054_95c7, 0x2df1_424c, 0x9efc_4947, 0x5c6b_fb31,
+];
+
+#[cfg(target_arch = "x86_64")]
+struct SimdBlocked {
+    backing: Vec<u32>, // num_blocks * 8 lanes, contiguous
+    num_blocks: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SimdBlocked {
+    fn new(n: usize, fp: f64) -> Self {
+        if !is_x86_feature_detected!("avx2") {
+            panic!("CPU lacks AVX2 — cannot run the simd mode here");
+        }
+        let (m, _k) = estimate(n, fp);
+        // 256 bits per block; size to roughly the same total memory as scalar blocked.
+        let num_blocks = ((m as f64) / 256.0).ceil() as u64;
+        let num_blocks = num_blocks.max(1);
+        SimdBlocked {
+            backing: vec![0u32; num_blocks as usize * 8],
+            num_blocks,
+        }
+    }
+
+    // Build the 8-lane mask: one bit per 32-bit lane, index = (key32*SALT[lane]) >> 27.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn make_mask(key32: u32) -> __m256i {
+        let salt = _mm256_setr_epi32(
+            SALT[0] as i32, SALT[1] as i32, SALT[2] as i32, SALT[3] as i32,
+            SALT[4] as i32, SALT[5] as i32, SALT[6] as i32, SALT[7] as i32,
+        );
+        let key_vec = _mm256_set1_epi32(key32 as i32);
+        let prod = _mm256_mullo_epi32(key_vec, salt); // 8x key*salt
+        let idx = _mm256_srli_epi32::<27>(prod); // top 5 bits -> 0..31
+        let ones = _mm256_set1_epi32(1);
+        _mm256_sllv_epi32(ones, idx) // 1 << idx per lane
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn set_avx2(&mut self, key: u64) {
+        let h = xxh3_128(&key.to_le_bytes());
+        let block = ((h >> 64) as u64 % self.num_blocks) as usize;
+        let mask = Self::make_mask(h as u32);
+        let p = self.backing.as_mut_ptr().add(block * 8) as *mut __m256i;
+        let cur = _mm256_loadu_si256(p);
+        _mm256_storeu_si256(p, _mm256_or_si256(cur, mask));
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn check_avx2(&self, key: u64) -> bool {
+        let h = xxh3_128(&key.to_le_bytes());
+        let block = ((h >> 64) as u64 % self.num_blocks) as usize;
+        let mask = Self::make_mask(h as u32);
+        let p = self.backing.as_ptr().add(block * 8) as *const __m256i;
+        let cur = _mm256_loadu_si256(p);
+        // testc(a,b) == 1  iff  all bits of b are set in a  (containment)
+        _mm256_testc_si256(cur, mask) != 0
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Filter for SimdBlocked {
+    #[inline]
+    fn set(&mut self, key: u64) {
+        unsafe { self.set_avx2(key) }
+    }
+    #[inline]
+    fn check(&self, key: u64) -> bool {
+        unsafe { self.check_avx2(key) }
+    }
+    fn bits(&self) -> u64 {
+        self.num_blocks * 256
+    }
+    fn hashes(&self) -> u32 {
+        8 // one bit per lane
+    }
+}
+
+// ---- AVX2 split-block, 512-bit variant (8 lanes x 64 bits, k=8) ----
+// Same idea as SimdBlocked but the block is a FULL 64-byte cache line: two
+// __m256i halves, each 4x 64-bit lanes, one bit set per 64-bit lane. Keeping
+// k=8 (not 16) while doubling the block lowers the blocking penalty, so FP
+// improves toward the scalar 512-bit blocked filter — at still ONE cache miss.
+// Requires 64-byte alignment, else a line-sized block straddles two lines.
+#[cfg(target_arch = "x86_64")]
+const SALT64: [u64; 8] = [
+    0x9E37_79B9_7F4A_7C15, 0xBF58_476D_1CE4_E5B9,
+    0x94D0_49BB_1331_11EB, 0x2545_F491_4F6C_DD1D,
+    0xFF51_AFD7_ED55_8CCD, 0xC4CE_B9FE_1A85_EC53,
+    0xD6E8_FEB8_6659_FD93, 0xA076_1D64_78BD_642F,
+];
+
+#[cfg(target_arch = "x86_64")]
+struct SimdBlocked512 {
+    backing: Vec<u64>, // num_blocks*8 lanes + slack, 64B-aligned via `off`
+    off: usize,        // u64 offset to the first 64-byte boundary
+    num_blocks: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SimdBlocked512 {
+    fn new(n: usize, fp: f64) -> Self {
+        if !is_x86_feature_detected!("avx2") {
+            panic!("CPU lacks AVX2 — cannot run the simd512 mode here");
+        }
+        let (m, _k) = estimate(n, fp);
+        let num_blocks = ((m as f64) / 512.0).ceil() as u64;
+        let num_blocks = num_blocks.max(1);
+        let words = num_blocks as usize * 8;
+        let backing = vec![0u64; words + 8]; // 64B slack for alignment
+        let addr = backing.as_ptr() as usize;
+        let off = ((64 - (addr & 63)) & 63) / 8; // u64 units to next 64B boundary
+        SimdBlocked512 { backing, off, num_blocks }
+    }
+
+    // 8 lane masks, one bit per 64-bit lane: idx = (klo*SALT64[i]) >> 58  (0..63).
+    #[inline]
+    fn make_mask(klo: u64) -> [u64; 8] {
+        let mut m = [0u64; 8];
+        for i in 0..8 {
+            let idx = (klo.wrapping_mul(SALT64[i]) >> 58) as u32;
+            m[i] = 1u64 << idx;
+        }
+        m
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn set_avx2(&mut self, key: u64) {
+        let h = xxh3_128(&key.to_le_bytes());
+        let block = ((h >> 64) as u64 % self.num_blocks) as usize;
+        let m = Self::make_mask(h as u64);
+        let base = self.backing.as_mut_ptr().add(self.off + block * 8);
+        let plo = base as *mut __m256i;
+        let phi = base.add(4) as *mut __m256i;
+        let mlo = _mm256_setr_epi64x(m[0] as i64, m[1] as i64, m[2] as i64, m[3] as i64);
+        let mhi = _mm256_setr_epi64x(m[4] as i64, m[5] as i64, m[6] as i64, m[7] as i64);
+        _mm256_storeu_si256(plo, _mm256_or_si256(_mm256_loadu_si256(plo), mlo));
+        _mm256_storeu_si256(phi, _mm256_or_si256(_mm256_loadu_si256(phi), mhi));
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn check_avx2(&self, key: u64) -> bool {
+        let h = xxh3_128(&key.to_le_bytes());
+        let block = ((h >> 64) as u64 % self.num_blocks) as usize;
+        let m = Self::make_mask(h as u64);
+        let base = self.backing.as_ptr().add(self.off + block * 8);
+        let plo = base as *const __m256i;
+        let phi = base.add(4) as *const __m256i;
+        let mlo = _mm256_setr_epi64x(m[0] as i64, m[1] as i64, m[2] as i64, m[3] as i64);
+        let mhi = _mm256_setr_epi64x(m[4] as i64, m[5] as i64, m[6] as i64, m[7] as i64);
+        _mm256_testc_si256(_mm256_loadu_si256(plo), mlo) != 0
+            && _mm256_testc_si256(_mm256_loadu_si256(phi), mhi) != 0
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Filter for SimdBlocked512 {
+    #[inline]
+    fn set(&mut self, key: u64) {
+        unsafe { self.set_avx2(key) }
+    }
+    #[inline]
+    fn check(&self, key: u64) -> bool {
+        unsafe { self.check_avx2(key) }
+    }
+    fn bits(&self) -> u64 {
+        self.num_blocks * 512
+    }
+    fn hashes(&self) -> u32 {
+        8
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode: String = arg(&args, "--mode").unwrap_or_else(|| "blocked".to_string());
@@ -190,6 +383,16 @@ fn main() {
         "classic" => (
             "Rust classic (our XXH3 scheme)",
             Box::new(ClassicXXH3::new(capacity as usize, fp_rate)),
+        ),
+        #[cfg(target_arch = "x86_64")]
+        "simd" => (
+            "Rust SIMD split-block (AVX2, 256-bit, k=8)",
+            Box::new(SimdBlocked::new(capacity as usize, fp_rate)),
+        ),
+        #[cfg(target_arch = "x86_64")]
+        "simd512" => (
+            "Rust SIMD split-block (AVX2, 512-bit = 1 cache line, k=8)",
+            Box::new(SimdBlocked512::new(capacity as usize, fp_rate)),
         ),
         _ => (
             "Rust blocked (our XXH3 scheme)",
