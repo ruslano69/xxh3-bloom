@@ -283,6 +283,64 @@ impl Filter for SimdBlocked {
     }
 }
 
+// Two-phase batch (hash+prefetch a window, then apply) for the simd tier. The
+// vectorized mask (saves compute) and the prefetch (hides the cache miss)
+// compose: this is the "promising path" the Go side already showed beats the
+// scalar-blocked batch. We store only (offset, key32) and rebuild the mask in
+// phase 2 — the rebuild is cheap and fully overlapped with the arriving line.
+#[cfg(target_arch = "x86_64")]
+impl SimdBlocked {
+    #[target_feature(enable = "avx2")]
+    unsafe fn set_batch_avx2(&mut self, keys: &[u64], chunk: usize) {
+        let chunk = chunk.max(1);
+        let mut probes: Vec<(usize, u32)> = vec![(0, 0); chunk];
+        let mut base = 0;
+        while base < keys.len() {
+            let end = (base + chunk).min(keys.len());
+            let c = end - base;
+            for j in 0..c {
+                let h = xxh3_128(&keys[base + j].to_le_bytes());
+                let off = ((h >> 64) as u64 % self.num_blocks) as usize * 8;
+                prefetch(self.backing.as_ptr().add(off) as *const u64);
+                probes[j] = (off, h as u32);
+            }
+            for j in 0..c {
+                let (off, key32) = probes[j];
+                let mask = Self::make_mask(key32);
+                let p = self.backing.as_mut_ptr().add(off) as *mut __m256i;
+                let cur = _mm256_loadu_si256(p);
+                _mm256_storeu_si256(p, _mm256_or_si256(cur, mask));
+            }
+            base = end;
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn check_batch_avx2(&self, keys: &[u64], out: &mut [bool], chunk: usize) {
+        let chunk = chunk.max(1);
+        let mut probes: Vec<(usize, u32)> = vec![(0, 0); chunk];
+        let mut base = 0;
+        while base < keys.len() {
+            let end = (base + chunk).min(keys.len());
+            let c = end - base;
+            for j in 0..c {
+                let h = xxh3_128(&keys[base + j].to_le_bytes());
+                let off = ((h >> 64) as u64 % self.num_blocks) as usize * 8;
+                prefetch(self.backing.as_ptr().add(off) as *const u64);
+                probes[j] = (off, h as u32);
+            }
+            for j in 0..c {
+                let (off, key32) = probes[j];
+                let mask = Self::make_mask(key32);
+                let p = self.backing.as_ptr().add(off) as *const __m256i;
+                let cur = _mm256_loadu_si256(p);
+                out[base + j] = _mm256_testc_si256(cur, mask) != 0;
+            }
+            base = end;
+        }
+    }
+}
+
 // ---- AVX2 split-block, 512-bit variant (8 lanes x 64 bits, k=8) ----
 // Same idea as SimdBlocked but the block is a FULL 64-byte cache line: two
 // __m256i halves, each 4x 64-bit lanes, one bit set per 64-bit lane. Keeping
@@ -557,6 +615,44 @@ fn run_batch(capacity: u64, fill_pct: f64, fp: f64, queries: u64) {
     }
 }
 
+// run_batch_simd is the SIMD counterpart of run_batch: it sweeps the prefetch
+// window for the 256-bit split-block filter on both the fill and query paths,
+// so we can see how the vectorized mask + MLP combine against the scalar batch.
+#[cfg(target_arch = "x86_64")]
+fn run_batch_simd(capacity: u64, fill_pct: f64, fp: f64, queries: u64) {
+    let fill_n = (capacity as f64 * fill_pct / 100.0) as u64;
+    let f0 = SimdBlocked::new(capacity as usize, fp);
+    println!("=== Rust BATCH (simd 256-bit, AVX2) — MLP / prefetch sweep ===");
+    println!("Capacity : {} elements   Fill: {}", commas(capacity), commas(fill_n));
+    println!("Bits (m) : {}  ({:.2} GB)   k = {}\n",
+        commas(f0.bits()), f0.bits() as f64 / 8.0 / 1e9, f0.hashes());
+
+    let fkeys: Vec<u64> = (0..fill_n).collect();
+    println!("[Fill batch — ns/op by prefetch window]  (chunk=1 ≈ no MLP baseline)");
+    for &chunk in &[1usize, 8, 16, 32, 64] {
+        let mut ff = SimdBlocked::new(capacity as usize, fp);
+        let start = Instant::now();
+        unsafe { ff.set_batch_avx2(&fkeys, chunk) };
+        let ns = start.elapsed().as_nanos() as f64 / fill_n as f64;
+        println!("  chunk={:4}  {:6.1} ns/op", chunk, ns);
+    }
+
+    let mut f = SimdBlocked::new(capacity as usize, fp);
+    unsafe { f.set_batch_avx2(&fkeys, 16) };
+    let qkeys: Vec<u64> = (0..queries).map(|i| i % fill_n).collect();
+    let mut out = vec![false; queries as usize];
+    println!("\n[TP batch query — ns/op by prefetch window]  (chunk=1 ≈ no MLP baseline)");
+    for &chunk in &[1usize, 2, 4, 8, 16, 32, 64, 128] {
+        let start = Instant::now();
+        unsafe { f.check_batch_avx2(&qkeys, &mut out, chunk) };
+        let d = start.elapsed();
+        let hits = out.iter().filter(|&&b| b).count();
+        let ns = d.as_nanos() as f64 / queries as f64;
+        println!("  chunk={:4}  {:6.1} ns/op  hits={}", chunk, ns, commas(hits as u64));
+        assert_eq!(hits as u64, queries, "false negatives at chunk {}", chunk);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode: String = arg(&args, "--mode").unwrap_or_else(|| "blocked".to_string());
@@ -567,6 +663,11 @@ fn main() {
     let fill_n = (capacity as f64 * fill_pct / 100.0) as u64;
 
     if args.iter().any(|a| a == "--batch") {
+        #[cfg(target_arch = "x86_64")]
+        if mode == "simd" {
+            run_batch_simd(capacity, fill_pct, fp_rate, queries);
+            return;
+        }
         run_batch(capacity, fill_pct, fp_rate, queries);
         return;
     }
