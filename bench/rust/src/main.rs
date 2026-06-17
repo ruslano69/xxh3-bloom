@@ -374,6 +374,86 @@ impl Filter for SimdBlocked512 {
     }
 }
 
+// ---- Batch query with software prefetch (memory-level parallelism) ----
+#[inline(always)]
+fn prefetch(p: *const u64) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        _mm_prefetch::<{ _MM_HINT_T0 }>(p as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
+impl BlockedXXH3 {
+    // Chunked two-phase batch test: hash a chunk of keys and prefetch all their
+    // cache lines, then run the k-probe checks once the lines are arriving. This
+    // keeps many misses in flight (memory-level parallelism) instead of one per
+    // dependent lookup. `chunk` is the prefetch window we sweep.
+    fn check_batch(&self, keys: &[u64], out: &mut [bool], chunk: usize) {
+        let chunk = chunk.max(1);
+        let mut probes: Vec<(usize, u32, u32)> = vec![(0, 0, 0); chunk];
+        let mut base = 0;
+        while base < keys.len() {
+            let end = (base + chunk).min(keys.len());
+            let c = end - base;
+            // phase 1: hash + prefetch each key's block line
+            for j in 0..c {
+                let p = self.block_off(keys[base + j]);
+                prefetch(unsafe { self.backing.as_ptr().add(p.0) });
+                probes[j] = p;
+            }
+            // phase 2: probe (lines now in or arriving to cache)
+            for j in 0..c {
+                let (off, mut a, mut b) = probes[j];
+                let mut hit = true;
+                for i in 0..self.k {
+                    let bit = a & BLOCK_MASK;
+                    if self.backing[off + (bit >> 6) as usize] & (1u64 << (bit & 63)) == 0 {
+                        hit = false;
+                        break;
+                    }
+                    a = a.wrapping_add(b);
+                    b = b.wrapping_add(i);
+                }
+                out[base + j] = hit;
+            }
+            base = end;
+        }
+    }
+}
+
+fn run_batch(capacity: u64, fill_pct: f64, fp: f64, queries: u64) {
+    let fill_n = (capacity as f64 * fill_pct / 100.0) as u64;
+    let mut f = BlockedXXH3::with_range(capacity as usize, fp, true); // fastrange base
+    println!("=== Rust BATCH (blocked, fastrange) — MLP / prefetch sweep ===");
+    println!("Capacity : {} elements   Fill: {}", commas(capacity), commas(fill_n));
+    println!("Bits (m) : {}  ({:.2} GB)   k = {}\n",
+        commas(f.bits()), f.bits() as f64 / 8.0 / 1e9, f.hashes());
+
+    let start = Instant::now();
+    for i in 0..fill_n {
+        f.set(i);
+    }
+    println!("[Fill] {:.0} ns/op\n", start.elapsed().as_nanos() as f64 / fill_n as f64);
+
+    // true positives: every key present, so each probe must load its block
+    let qkeys: Vec<u64> = (0..queries).map(|i| i % fill_n).collect();
+    let mut out = vec![false; queries as usize];
+
+    println!("[TP batch query — ns/op by prefetch window]  (chunk=1 ≈ no MLP baseline)");
+    for &chunk in &[1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
+        let start = Instant::now();
+        f.check_batch(&qkeys, &mut out, chunk);
+        let d = start.elapsed();
+        let hits = out.iter().filter(|&&b| b).count();
+        let ns = d.as_nanos() as f64 / queries as f64;
+        println!("  chunk={:4}  {:6.1} ns/op  {:6.1} M/s  hits={}",
+            chunk, ns, 1e3 / ns, commas(hits as u64));
+        assert_eq!(hits as u64, queries, "false negatives at chunk {}", chunk);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode: String = arg(&args, "--mode").unwrap_or_else(|| "blocked".to_string());
@@ -382,6 +462,11 @@ fn main() {
     let fp_rate: f64 = arg(&args, "--fp").unwrap_or(0.01);
     let queries: u64 = arg(&args, "--queries").unwrap_or(10_000_000);
     let fill_n = (capacity as f64 * fill_pct / 100.0) as u64;
+
+    if args.iter().any(|a| a == "--batch") {
+        run_batch(capacity, fill_pct, fp_rate, queries);
+        return;
+    }
 
     let (label, filter): (&str, Box<dyn Filter>) = match mode.as_str() {
         "siphash" => (

@@ -115,6 +115,37 @@ back-to-back at 200M, same memory:
 - **Net: a clean tradeoff triangle.** `simd` = fastest, worst FP; `simd512` = scalar-blocked
   accuracy and lookup but ~1.8× faster fill; `blocked` = best FP among blocked, slowest fill.
 
+## Batch + prefetch: memory-level parallelism (`--batch`)
+
+A single blocked lookup is **latency-bound**: it holds exactly one cache miss in
+flight and waits ~one DRAM access (~80 ns) for it. But a CPU can service ~10–12
+misses concurrently (line-fill buffers). `check_batch` exploits that: it hashes a
+chunk of keys, issues `_mm_prefetch` for all their cache lines, then runs the
+probes once the lines are arriving — many misses overlap instead of one.
+
+Sweep of the prefetch window (`blocked`+fastrange, 200M, 100% fill, TP queries,
+two runs):
+
+| chunk (window) | ns/op | throughput | vs single-lookup |
+|---|---|---|---|
+| 1 (no MLP) | ~82 | ~12 M/s | 1.0× |
+| 4 | ~57 | ~17 M/s | 1.4× |
+| 8 | ~40 | ~25 M/s | 2.0× |
+| 16 | ~28 | ~36 M/s | 2.9× |
+| 32–256 | **~26** | **~38 M/s** | **~3.3×** |
+
+- **~3.3× throughput** over the single-lookup path, plateauing at window 16–64 —
+  exactly where the ~10–12 line-fill buffers saturate. Past ~128 it stops helping
+  (more outstanding lines than the core/L2 can track).
+- This is the answer to "where is the speed, if not in the hash": **not** in the
+  hash, the modulo, or call dispatch — in **overlapping cache misses**. The
+  ~80 ns "memory floor" is only a floor for a *single dependent* lookup, not for
+  throughput. No false negatives at any window.
+- It needs a **batch API** (`TestBatch([]key)`), not a faster single `Test`, and
+  only helps when callers have keys in bulk (scans, request batches) — which the
+  high-RPS pre-filter cases do. On chips with more outstanding-miss slots (Zen 4,
+  servers) the ceiling should be higher.
+
 Conclusions:
 
 - **At an identical hash + algorithm, Rust is ~1.2–1.6× faster than Go** — real,
