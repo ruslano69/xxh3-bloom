@@ -2,10 +2,13 @@
 // Same methodology: fill N 8-byte little-endian keys, then time true-positive
 // and true-negative queries and measure the actual false-positive rate.
 //
-// Three modes (--mode):
+// Modes (--mode):
 //   siphash  -> bloomfilter 3.0.1 crate (classic, SipHash-1-3) — the baseline
 //   classic  -> our classic filter ported to Rust (XXH3-128, same scheme as Go)
 //   blocked  -> our cache-local blocked filter ported to Rust (XXH3-128)
+//   simd     -> AVX2 split-block 256-bit (8×32, k=8, fully vectorized mask)
+//   simd512  -> AVX2 split-block 512-bit (8×64, k=8, scalar mask — AVX2 lacks mullo_epi64)
+//   avx512   -> AVX-512F+DQ split-block 512-bit (8×64, k=8, fully vectorized mask via mullo_epi64)
 //
 // Modes `classic` and `blocked` use the EXACT same algorithm and hash as the Go
 // implementation, so comparing them against the Go numbers isolates language
@@ -377,6 +380,103 @@ impl Filter for SimdBlocked512 {
     }
 }
 
+// ---- AVX-512 split-block filter (AVX-512F + AVX-512DQ, 512-bit = 1 cache line, k=8) ----
+// Identical block layout to SimdBlocked512, but the mask is built FULLY IN-VECTOR:
+//   _mm512_mullo_epi64  (AVX-512DQ) — 64-bit lane multiply, missing in AVX2
+//   _mm512_sllv_epi64  (AVX-512F)  — variable shift per lane
+// One __m512i register holds the whole block, so set/check collapse to:
+//   set   -> block = _mm512_or_si512(block, mask)   (1 load, 1 OR, 1 store)
+//   check -> t = andnot(block, mask); contained iff test_epi64_mask(t,t) == 0
+//
+// NOTE: _mm512_mullo_epi64 requires AVX-512DQ (Zen 4 / Ice Lake+).
+//       The binary is safe on older CPUs: the runtime check panics before any
+//       AVX-512 instruction executes. Validate FP on first Zen 4 run.
+#[cfg(target_arch = "x86_64")]
+struct SimdBlocked512Avx512 {
+    backing: Vec<u64>, // num_blocks*8 lanes + 8 slack, 64B-aligned via `off`
+    off: usize,        // u64 offset to the first 64-byte boundary
+    num_blocks: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SimdBlocked512Avx512 {
+    fn new(n: usize, fp: f64) -> Self {
+        if !is_x86_feature_detected!("avx512f") || !is_x86_feature_detected!("avx512dq") {
+            panic!("CPU lacks AVX-512F+DQ — cannot run avx512 mode here");
+        }
+        let (m, _k) = estimate(n, fp);
+        let num_blocks = ((m as f64) / 512.0).ceil() as u64;
+        let num_blocks = num_blocks.max(1);
+        let words = num_blocks as usize * 8;
+        let backing = vec![0u64; words + 8]; // 64B slack for alignment
+        let addr = backing.as_ptr() as usize;
+        let off = ((64 - (addr & 63)) & 63) / 8;
+        SimdBlocked512Avx512 { backing, off, num_blocks }
+    }
+
+    // Build 8-lane mask fully in-vector: idx = (klo * SALT64[lane]) >> 58 → 0..63
+    // Requires AVX-512DQ for _mm512_mullo_epi64.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512dq")]
+    unsafe fn make_mask(klo: u64) -> __m512i {
+        let key_vec = _mm512_set1_epi64(klo as i64);
+        // _mm512_set_epi64 args: e7..e0, so pass SALT64[7..0] to put SALT64[i] in lane i.
+        let salt_vec = _mm512_set_epi64(
+            SALT64[7] as i64, SALT64[6] as i64, SALT64[5] as i64, SALT64[4] as i64,
+            SALT64[3] as i64, SALT64[2] as i64, SALT64[1] as i64, SALT64[0] as i64,
+        );
+        let prod = _mm512_mullo_epi64(key_vec, salt_vec); // klo * salt per lane
+        let idx  = _mm512_srli_epi64::<58>(prod);         // top 6 bits → 0..63
+        _mm512_sllv_epi64(_mm512_set1_epi64(1), idx)      // 1 << idx per lane
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512dq")]
+    unsafe fn set_avx512(&mut self, key: u64) {
+        let h = xxh3_128(&key.to_le_bytes());
+        let hi = (h >> 64) as u64;
+        let lo = h as u64;
+        let block = ((hi as u128 * self.num_blocks as u128) >> 64) as usize; // fastrange
+        let mask = Self::make_mask(lo);
+        let p = self.backing.as_mut_ptr().add(self.off + block * 8) as *mut __m512i;
+        let cur = _mm512_loadu_si512(p as *const __m512i);
+        _mm512_storeu_si512(p, _mm512_or_si512(cur, mask));
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512dq")]
+    unsafe fn check_avx512(&self, key: u64) -> bool {
+        let h = xxh3_128(&key.to_le_bytes());
+        let hi = (h >> 64) as u64;
+        let lo = h as u64;
+        let block = ((hi as u128 * self.num_blocks as u128) >> 64) as usize;
+        let mask = Self::make_mask(lo);
+        let p = self.backing.as_ptr().add(self.off + block * 8) as *const __m512i;
+        let cur = _mm512_loadu_si512(p);
+        // t = bits in mask that are NOT in cur; contained iff t is all-zero.
+        let t = _mm512_andnot_si512(cur, mask);
+        _mm512_test_epi64_mask(t, t) == 0
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Filter for SimdBlocked512Avx512 {
+    #[inline]
+    fn set(&mut self, key: u64) {
+        unsafe { self.set_avx512(key) }
+    }
+    #[inline]
+    fn check(&self, key: u64) -> bool {
+        unsafe { self.check_avx512(key) }
+    }
+    fn bits(&self) -> u64 {
+        self.num_blocks * 512
+    }
+    fn hashes(&self) -> u32 {
+        8
+    }
+}
+
 // ---- Batch query with software prefetch (memory-level parallelism) ----
 #[inline(always)]
 fn prefetch(p: *const u64) {
@@ -495,6 +595,11 @@ fn main() {
         "simd512" => (
             "Rust SIMD split-block (AVX2, 512-bit = 1 cache line, k=8)",
             Box::new(SimdBlocked512::new(capacity as usize, fp_rate)),
+        ),
+        #[cfg(target_arch = "x86_64")]
+        "avx512" => (
+            "Rust SIMD split-block (AVX-512F+DQ, 512-bit = 1 cache line, k=8, vectorized mask)",
+            Box::new(SimdBlocked512Avx512::new(capacity as usize, fp_rate)),
         ),
         _ => (
             "Rust blocked (our XXH3 scheme)",
