@@ -400,10 +400,10 @@ func TestSipHashSeedSeparation(t *testing.T) {
 	if a.Equal(b) {
 		t.Fatal("SipHash under different seeds produced identical bits")
 	}
-	// round-trips as v4 with hash + seed preserved
+	// round-trips as v6 with hash + seed preserved
 	blob, _ := a.MarshalBinary()
-	if blob[4] != 5 {
-		t.Fatalf("filter must serialize as v5, got %d", blob[4])
+	if blob[4] != 6 {
+		t.Fatalf("filter must serialize as v6, got %d", blob[4])
 	}
 	var dst xxhbloom.BlockedFilter
 	if err := dst.UnmarshalBinary(blob); err != nil {
@@ -414,7 +414,7 @@ func TestSipHashSeedSeparation(t *testing.T) {
 	}
 }
 
-// A Murmur3 filter must serialize as v4 and round-trip with the hash preserved.
+// A Murmur3 filter must serialize as v6 and round-trip with the hash preserved.
 func TestPluggableHashSerialization(t *testing.T) {
 	src := xxhbloom.NewBlockedTuned(20_000, 0.01, xxhbloom.WithHash(xxhbloom.Murmur3), xxhbloom.WithSeed(99))
 	buf := make([]byte, 8)
@@ -426,8 +426,8 @@ func TestPluggableHashSerialization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBinary: %v", err)
 	}
-	if blob[4] != 5 {
-		t.Fatalf("filter must serialize as v5, got version %d", blob[4])
+	if blob[4] != 6 {
+		t.Fatalf("filter must serialize as v6, got version %d", blob[4])
 	}
 	var dst xxhbloom.BlockedFilter
 	if err := dst.UnmarshalBinary(blob); err != nil {
@@ -447,12 +447,12 @@ func TestPluggableHashSerialization(t *testing.T) {
 	}
 }
 
-// All filters serialize as v5 now (the enhanced-probe format).
-func TestWritesV5(t *testing.T) {
+// All filters serialize as v6 now (enhanced-probe format + fastrange block index).
+func TestWritesV6(t *testing.T) {
 	f := xxhbloom.NewBlocked(5_000, 0.01)
 	blob, _ := f.MarshalBinary()
-	if blob[4] != 5 {
-		t.Fatalf("filter must serialize as v5, got version %d", blob[4])
+	if blob[4] != 6 {
+		t.Fatalf("filter must serialize as v6, got version %d", blob[4])
 	}
 }
 

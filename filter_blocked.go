@@ -22,9 +22,9 @@ import (
 // throughput gain at scale.
 
 const (
-	blockBits  = 512               // one cache line worth of bits (64 B)
-	blockWords = blockBits / 64     // 8 uint64 per block
-	blockMask  = blockBits - 1      // for & instead of % (512 is power of two)
+	blockBits  = 512            // one cache line worth of bits (64 B)
+	blockWords = blockBits / 64 // 8 uint64 per block
+	blockMask  = blockBits - 1  // for & instead of % (512 is power of two)
 )
 
 type BlockedFilter struct {
@@ -35,6 +35,11 @@ type BlockedFilter struct {
 	seed      uint64 // keyed-hash seed; 0 = unseeded (see RandomSeed / threat model)
 	hash      HashKind
 	hasher    Hasher
+	// fastrange selects the block index with Lemire's (hi*N)>>64 instead of a
+	// 64-bit modulo. It is the default for new filters (v6 format); filters
+	// loaded from a v5 file keep modulo so their on-disk bit layout still maps
+	// each key to the same block. The chosen mode is recorded in the header.
+	fastrange bool
 }
 
 // NewBlocked builds a blocked filter with capacity for n items at fp, configured
@@ -101,12 +106,13 @@ func newBlockedRaw(numBlocks uint64, k uint, c config) *BlockedFilter {
 	if err != nil {
 		panic(err)
 	}
-	return allocBlocked(numBlocks, k, c.seed, c.hash, h)
+	// New filters use fastrange (the v6 default).
+	return allocBlocked(numBlocks, k, c.seed, c.hash, h, true)
 }
 
 // allocBlocked builds the struct from already-resolved parts (shared by
 // construction and deserialization, which resolves the hasher itself).
-func allocBlocked(numBlocks uint64, k uint, seed uint64, hash HashKind, hasher Hasher) *BlockedFilter {
+func allocBlocked(numBlocks uint64, k uint, seed uint64, hash HashKind, hasher Hasher, fastrange bool) *BlockedFilter {
 	if numBlocks < 1 {
 		numBlocks = 1
 	}
@@ -119,6 +125,7 @@ func allocBlocked(numBlocks uint64, k uint, seed uint64, hash HashKind, hasher H
 		seed:      seed,
 		hash:      hash,
 		hasher:    hasher,
+		fastrange: fastrange,
 	}
 }
 
@@ -200,7 +207,14 @@ func newAlignedBlocks(numBlocks uint64) (view, backing []uint64) {
 // plus the two 32-bit sub-hashes used to derive the k bit positions.
 func (f *BlockedFilter) blockOffset(data []byte) (off uint64, h1, h2 uint32) {
 	hi, lo := f.hasher(data, f.seed)
-	blockIdx := hi % f.numBlocks
+	// fastrange (Lemire): map hi into [0,numBlocks) with a widening multiply +
+	// shift instead of a 64-bit DIV. modulo is kept for filters loaded from v5.
+	var blockIdx uint64
+	if f.fastrange {
+		blockIdx, _ = bits.Mul64(hi, f.numBlocks)
+	} else {
+		blockIdx = hi % f.numBlocks
+	}
 	off = blockIdx * blockWords
 	h1 = uint32(lo)
 	h2 = uint32(lo>>32) | 1 // odd stride: coprime with 512 so all k probes are distinct
@@ -247,19 +261,26 @@ func (f *BlockedFilter) Hash() HashKind { return f.hash }
 
 // --- Serialization ---
 //
-// The current format is v5 (40-byte self-describing header):
-//   [8] magic   "BBLM\x05\x00\x00\x00"   (byte 4 = format version)
-//   [1] payload endianness   0 = little, 1 = big
-//   [1] hash kind
-//   [6] reserved (zero)
+// The current format is v6 (40-byte self-describing header):
+//   [8] magic   "BBLM\x06\x00\x00\x00"   (byte 4 = format version)
+//   [1] payload endianness   0 = little, 1 = big   (offset 8)
+//   [1] hash kind                                  (offset 9)
+//   [1] range mode   0 = modulo, 1 = fastrange     (offset 10)
+//   [5] reserved (zero)                            (offset 11..15)
 //   [8] numBlocks   (little-endian)
 //   [8] k           (little-endian)
 //   [8] seed        (little-endian)
 //   [numBlocks*64] raw bit array, one 64-byte cache line per block
 //
 // The payload is dumped raw for speed. WriteTo emits the host's byte order and
-// records it; ReadFrom byte-swaps on the rare cross-endian load, so v5 files
-// are portable.
+// records it; ReadFrom byte-swaps on the rare cross-endian load, so files are
+// portable.
+//
+// v6 adds the range-mode byte (offset 10, previously reserved/zero). It records
+// how the block index is derived: the on-disk bit layout depends on it, so the
+// reader must use the same function it was written with. v5 files have a zero
+// there, which reads as modulo — exactly how v5 filters were built — so they
+// load unchanged. New filters default to fastrange and are written as v6.
 //
 // Formats v1–v4 (≤ v0.6.0) used a flawed in-block double-hashing probe scheme
 // and a DIFFERENT bit layout. v5 switched to enhanced double hashing, so old
@@ -268,7 +289,12 @@ func (f *BlockedFilter) Hash() HashKind { return f.hash }
 // such filters must be regenerated from source data (a Bloom filter cannot be
 // rebuilt from its bits alone).
 
-const blockedHdrV5 = 40
+const (
+	blockedHdr         = 40 // header size, unchanged from v5 to v6
+	blockedVersion     = 6  // current format version written by WriteTo
+	rangeModeModulo    = 0
+	rangeModeFastrange = 1
+)
 
 var blockedMagicPrefix = [4]byte{'B', 'B', 'L', 'M'}
 
@@ -289,13 +315,18 @@ func blocksAsBytes(blocks []uint64) []byte {
 // WriteTo writes a v5 representation of the filter to w. It returns the number
 // of bytes written. Wrap w in a bufio.Writer for disk/network.
 func (f *BlockedFilter) WriteTo(w io.Writer) (int64, error) {
-	var hdr [blockedHdrV5]byte
+	var hdr [blockedHdr]byte
 	copy(hdr[0:4], blockedMagicPrefix[:])
-	hdr[4] = 5 // version
+	hdr[4] = blockedVersion
 	if nativeBigEndian {
 		hdr[8] = 1
 	}
 	hdr[9] = byte(f.hash)
+	if f.fastrange {
+		hdr[10] = rangeModeFastrange
+	} else {
+		hdr[10] = rangeModeModulo
+	}
 	binary.LittleEndian.PutUint64(hdr[16:24], f.numBlocks)
 	binary.LittleEndian.PutUint64(hdr[24:32], uint64(f.k))
 	binary.LittleEndian.PutUint64(hdr[32:40], f.seed)
@@ -322,8 +353,9 @@ func (f *BlockedFilter) ReadFrom(r io.Reader) (int64, error) {
 	}
 	version := magic[4]
 	switch {
-	case version == 5:
-		// current
+	case version == 5 || version == 6:
+		// v5 and v6 share the same 40-byte layout; v5's reserved byte at
+		// offset 10 is zero, which reads as modulo — how v5 filters were built.
 	case version >= 1 && version <= 4:
 		return 8, fmt.Errorf("bloom: blocked filter format v%d (written by <0.7.0) uses an "+
 			"incompatible probe scheme; regenerate it from source data", version)
@@ -331,7 +363,7 @@ func (f *BlockedFilter) ReadFrom(r io.Reader) (int64, error) {
 		return 8, fmt.Errorf("bloom: unsupported blocked format version %d", version)
 	}
 
-	restSize := blockedHdrV5 - 8
+	restSize := blockedHdr - 8
 	rest := make([]byte, restSize)
 	if _, err := io.ReadFull(r, rest); err != nil {
 		return 8, err
@@ -339,6 +371,7 @@ func (f *BlockedFilter) ReadFrom(r io.Reader) (int64, error) {
 
 	payloadBig := rest[0] == 1
 	hash := HashKind(rest[1])
+	fastrange := rest[2] == rangeModeFastrange // offset 10; zero (modulo) for v5
 	numBlocks := binary.LittleEndian.Uint64(rest[8:16])
 	k := uint(binary.LittleEndian.Uint64(rest[16:24]))
 	seed := binary.LittleEndian.Uint64(rest[24:32])
@@ -348,7 +381,7 @@ func (f *BlockedFilter) ReadFrom(r io.Reader) (int64, error) {
 		return int64(8 + restSize), err
 	}
 
-	nf := allocBlocked(numBlocks, k, seed, hash, hasher)
+	nf := allocBlocked(numBlocks, k, seed, hash, hasher, fastrange)
 	buf := blocksAsBytes(nf.blocks)
 	m, rerr := io.ReadFull(r, buf)
 	read := int64(8 + restSize + m)
@@ -372,7 +405,7 @@ func swapWords(words []uint64) {
 // MarshalBinary implements encoding.BinaryMarshaler.
 func (f *BlockedFilter) MarshalBinary() ([]byte, error) {
 	var buf bytes.Buffer
-	buf.Grow(blockedHdrV5 + len(f.blocks)*8)
+	buf.Grow(blockedHdr + len(f.blocks)*8)
 	if _, err := f.WriteTo(&buf); err != nil {
 		return nil, err
 	}
@@ -387,7 +420,8 @@ func (f *BlockedFilter) UnmarshalBinary(data []byte) error {
 
 // Equal reports whether two blocked filters have identical shape and contents.
 func (f *BlockedFilter) Equal(g *BlockedFilter) bool {
-	if f.numBlocks != g.numBlocks || f.k != g.k || f.seed != g.seed || f.hash != g.hash {
+	if f.numBlocks != g.numBlocks || f.k != g.k || f.seed != g.seed ||
+		f.hash != g.hash || f.fastrange != g.fastrange {
 		return false
 	}
 	return bytes.Equal(blocksAsBytes(f.blocks), blocksAsBytes(g.blocks))
