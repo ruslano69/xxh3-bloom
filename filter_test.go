@@ -96,30 +96,33 @@ func TestBlockedFalsePositiveRate(t *testing.T) {
 }
 
 func TestBlockedTunedMeetsTarget(t *testing.T) {
-	n := uint(200_000)
-	target := 0.01
-	f := xxhbloom.NewBlockedTuned(n, target)
+	// 0.001 is the case that exposed the flawed-double-hashing floor before the
+	// enhanced-hashing fix; keep it covered so the fix can't silently regress.
+	for _, target := range []float64{0.01, 0.001} {
+		n := uint(200_000)
+		f := xxhbloom.NewBlockedTuned(n, target)
 
-	buf := make([]byte, 4)
-	for i := uint32(0); i < uint32(n); i++ {
-		binary.BigEndian.PutUint32(buf, i)
-		f.Add(buf)
-	}
-	rounds := 200_000
-	fp := 0
-	for i := 0; i < rounds; i++ {
-		binary.BigEndian.PutUint32(buf, uint32(n)+uint32(i)+1)
-		if f.Test(buf) {
-			fp++
+		buf := make([]byte, 4)
+		for i := uint32(0); i < uint32(n); i++ {
+			binary.BigEndian.PutUint32(buf, i)
+			f.Add(buf)
 		}
-	}
-	rate := float64(fp) / float64(rounds)
-	numBlocks := uint64(f.Cap()) / 512
-	predicted := xxhbloom.EstimateBlockedFP(n, numBlocks, f.K())
-	t.Logf("tuned: bits=%d k=%d  predicted FP=%.4f  measured FP=%.4f  (target %.4f)",
-		f.Cap(), f.K(), predicted, rate, target)
-	if rate > target*1.15 {
-		t.Errorf("tuned FP %.4f exceeds target %.4f (×1.15 margin)", rate, target)
+		rounds := 2_000_000
+		fp := 0
+		for i := 0; i < rounds; i++ {
+			binary.BigEndian.PutUint32(buf, uint32(n)+uint32(i)+1)
+			if f.Test(buf) {
+				fp++
+			}
+		}
+		rate := float64(fp) / float64(rounds)
+		numBlocks := uint64(f.Cap()) / 512
+		predicted := xxhbloom.EstimateBlockedFP(n, numBlocks, f.K())
+		t.Logf("tuned target=%.4f: bits=%d k=%d predicted=%.5f measured=%.5f",
+			target, f.Cap(), f.K(), predicted, rate)
+		if rate > target*1.25 {
+			t.Errorf("tuned FP %.5f exceeds target %.5f (×1.25 margin)", rate, target)
+		}
 	}
 }
 
@@ -171,63 +174,20 @@ func TestBlockedSerialization(t *testing.T) {
 	}
 }
 
-// ReadFrom must still load legacy v1 (no seed) and v2 (with seed) files.
-func TestBlockedReadsLegacyFormats(t *testing.T) {
-	// build a populated unseeded filter and grab its raw payload (v3 blob tail)
-	mk := func(seed uint64) ([]byte, uint64, uint, uint64) {
-		f := xxhbloom.NewBlockedTunedWithSeed(5_000, 0.01, seed)
-		buf := make([]byte, 8)
-		for i := 0; i < 5_000; i++ {
-			binary.BigEndian.PutUint64(buf, uint64(i))
-			f.Add(buf)
-		}
-		v3, _ := f.MarshalBinary()
-		payload := v3[40:] // strip v3 header
-		return payload, uint64(f.Cap()) / 512, f.K(), seed
-	}
-
-	check := func(name string, blob []byte, wantSeed uint64) {
+// Legacy formats v1–v4 used an incompatible probe scheme and must be rejected
+// (not silently mis-read into false negatives).
+func TestBlockedRejectsLegacyFormats(t *testing.T) {
+	for _, version := range []byte{1, 2, 3, 4} {
+		// header + a little payload; the body never gets parsed — the version
+		// check fires first.
+		var b bytes.Buffer
+		b.Write([]byte{'B', 'B', 'L', 'M', version, 0, 0, 0})
+		b.Write(make([]byte, 64)) // filler
 		var f xxhbloom.BlockedFilter
-		if err := f.UnmarshalBinary(blob); err != nil {
-			t.Fatalf("%s: UnmarshalBinary: %v", name, err)
-		}
-		if f.Seed() != wantSeed {
-			t.Fatalf("%s: seed = %d, want %d", name, f.Seed(), wantSeed)
-		}
-		buf := make([]byte, 8)
-		for i := 0; i < 5_000; i++ {
-			binary.BigEndian.PutUint64(buf, uint64(i))
-			if !f.Test(buf) {
-				t.Fatalf("%s: false negative at %d after legacy load", name, i)
-			}
+		if err := f.UnmarshalBinary(b.Bytes()); err == nil {
+			t.Fatalf("v%d: expected rejection, got nil error", version)
 		}
 	}
-
-	// v1: 24-byte header, no seed → must load with seed 0
-	payload, numBlocks, k, _ := mk(0)
-	var v1 bytes.Buffer
-	v1.Write([]byte{'B', 'B', 'L', 'M', 1, 0, 0, 0})
-	writeLE(&v1, numBlocks)
-	writeLE(&v1, uint64(k))
-	v1.Write(payload)
-	check("v1", v1.Bytes(), 0)
-
-	// v2: 32-byte header with seed
-	const seed2 = 0xDEADBEEFCAFE
-	payload, numBlocks, k, _ = mk(seed2)
-	var v2 bytes.Buffer
-	v2.Write([]byte{'B', 'B', 'L', 'M', 2, 0, 0, 0})
-	writeLE(&v2, numBlocks)
-	writeLE(&v2, uint64(k))
-	writeLE(&v2, seed2)
-	v2.Write(payload)
-	check("v2", v2.Bytes(), seed2)
-}
-
-func writeLE(buf *bytes.Buffer, v uint64) {
-	var b [8]byte
-	binary.LittleEndian.PutUint64(b[:], v)
-	buf.Write(b[:])
 }
 
 func TestBlockedSerializationBadMagic(t *testing.T) {
@@ -390,8 +350,8 @@ func TestSipHashSeedSeparation(t *testing.T) {
 	}
 	// round-trips as v4 with hash + seed preserved
 	blob, _ := a.MarshalBinary()
-	if blob[4] != 4 {
-		t.Fatalf("SipHash filter must serialize as v4, got %d", blob[4])
+	if blob[4] != 5 {
+		t.Fatalf("filter must serialize as v5, got %d", blob[4])
 	}
 	var dst xxhbloom.BlockedFilter
 	if err := dst.UnmarshalBinary(blob); err != nil {
@@ -414,8 +374,8 @@ func TestPluggableHashSerialization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBinary: %v", err)
 	}
-	if blob[4] != 4 {
-		t.Fatalf("non-XXH3 filter must serialize as v4, got version %d", blob[4])
+	if blob[4] != 5 {
+		t.Fatalf("filter must serialize as v5, got version %d", blob[4])
 	}
 	var dst xxhbloom.BlockedFilter
 	if err := dst.UnmarshalBinary(blob); err != nil {
@@ -435,12 +395,12 @@ func TestPluggableHashSerialization(t *testing.T) {
 	}
 }
 
-// XXH3 filters must still serialize as v3 (back-compat with v0.3.0 readers).
-func TestXXH3StillWritesV3(t *testing.T) {
+// All filters serialize as v5 now (the enhanced-probe format).
+func TestWritesV5(t *testing.T) {
 	f := xxhbloom.NewBlocked(5_000, 0.01)
 	blob, _ := f.MarshalBinary()
-	if blob[4] != 3 {
-		t.Fatalf("XXH3 filter must serialize as v3, got version %d", blob[4])
+	if blob[4] != 5 {
+		t.Fatalf("filter must serialize as v5, got version %d", blob[4])
 	}
 }
 

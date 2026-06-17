@@ -135,26 +135,31 @@ impl BlockedXXH3 {
         let hi = (h >> 64) as u64;
         let lo = h as u64;
         let block = (hi % self.num_blocks) as usize;
-        (self.off + block * BLOCK_WORDS, lo as u32, (lo >> 32) as u32)
+        // odd stride for enhanced double hashing (matches the Go library)
+        (self.off + block * BLOCK_WORDS, lo as u32, ((lo >> 32) as u32) | 1)
     }
 }
 impl Filter for BlockedXXH3 {
     #[inline]
     fn set(&mut self, key: u64) {
-        let (off, h1, h2) = self.block_off(key);
+        let (off, mut a, mut b) = self.block_off(key);
         for i in 0..self.k {
-            let bit = h1.wrapping_add(i.wrapping_mul(h2)) & BLOCK_MASK;
+            let bit = a & BLOCK_MASK;
             self.backing[off + (bit >> 6) as usize] |= 1u64 << (bit & 63);
+            a = a.wrapping_add(b);
+            b = b.wrapping_add(i); // enhanced double hashing: triangular term
         }
     }
     #[inline]
     fn check(&self, key: u64) -> bool {
-        let (off, h1, h2) = self.block_off(key);
+        let (off, mut a, mut b) = self.block_off(key);
         for i in 0..self.k {
-            let bit = h1.wrapping_add(i.wrapping_mul(h2)) & BLOCK_MASK;
+            let bit = a & BLOCK_MASK;
             if self.backing[off + (bit >> 6) as usize] & (1u64 << (bit & 63)) == 0 {
                 return false;
             }
+            a = a.wrapping_add(b);
+            b = b.wrapping_add(i);
         }
         true
     }

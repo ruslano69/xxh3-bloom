@@ -24,11 +24,12 @@ Flags: `--mode`, `--capacity`, `--fill` (%), `--fp`, `--queries`.
 ## Why this matters
 
 The `classic` and `blocked` modes use the **exact same XXH3-128 values and bit
-formulas** as the Go code. This was verified empirically: the false-positive
-*counts* match Go bit-for-bit (e.g. classic `100,381`, blocked `144,112` over 10M
-negative queries), proving `zeebo/xxh3` and `xxhash-rust` produce identical
-hashes and that the port is faithful. Any remaining timing difference is therefore
-purely language/runtime.
+formulas** as the Go code (including the v0.7.0 enhanced double-hashing probe
+scheme). This was verified empirically: the false-positive *counts* match Go
+bit-for-bit (the classic tier produced an identical `100,381` over 10M negative
+queries), proving `zeebo/xxh3` and `xxhash-rust` produce identical hashes and that
+the port is faithful. Any remaining timing difference is therefore purely
+language/runtime.
 
 ## Measured results (Intel i7-7700, 200M elements, 100% fill, FP target 1%)
 
@@ -46,6 +47,11 @@ Blocked tier (our approach):
 |---|---|---|---|---|
 | Go (ours) | 138 | 136 | 98 | 1.441 % |
 | Rust (ours) | 86 | 125 | 90 | 1.441 % |
+
+(These blocked numbers predate the v0.7.0 enhanced-double-hashing fix; throughput
+is unchanged — the probe step costs the same — but the measured FP is now lower
+and closer to target. The Go↔Rust timing comparison, the point of this table, is
+unaffected.)
 
 Conclusions:
 

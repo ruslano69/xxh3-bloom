@@ -56,16 +56,23 @@ back exactly the shape of data a blocked filter needs**:
 ```go
 h := xxh3.Hash128(data)        // one call, zero allocations, 128 bits
 blockIdx := h.Hi % numBlocks   // high 64 bits → pick the cache line
-h1 := uint32(h.Lo)             // low 64 bits, lower half
-h2 := uint32(h.Lo >> 32)       //              upper half
-// k positions inside the block — Kirsch-Mitzenmacher double hashing:
-//   bit_i = (h1 + i*h2) mod 512
+a := uint32(h.Lo)              // low 64 bits, lower half
+b := uint32(h.Lo>>32) | 1      //              upper half (odd stride)
+// k positions inside the block via enhanced double hashing (Dillinger-Manolios):
+//   bit_i = a & 511; then a += b; b += i
 ```
 
-So from one hash we get both the **block index** and the **seed for in-block
-double-hashing** for free — no second pass over the data, no heap. The classic
+So from one hash we get both the **block index** and the two seeds for the in-block
+probe sequence for free — no second pass over the data, no heap. The classic
 `bits-and-blooms` runs Murmur3-128 twice for this (see `sum256`); one `Hash128` is
 enough for us. That's a simplification, not a faster hash.
+
+The probe sequence is **enhanced double hashing** (an odd stride plus a triangular
+term). Plain double hashing `a + i*b mod 512` collides badly when the stride shares
+factors with the power-of-two block size — exactly the
+[flaw RocksDB hit](https://github.com/facebook/rocksdb/issues/4120) — which floors
+the false-positive rate at high `k`. The enhanced sequence keeps the `k` probes
+distinct, so the blocked tiers hit their target FP down to ~0.001.
 
 ## Usage
 
@@ -162,24 +169,21 @@ loaded.ReadFrom(bufio.NewReader(fd2))
 ```
 
 The bit array is dumped raw via `unsafe` (no reflection — a GB-scale filter would
-take minutes through `binary.Write`). The format is self-describing: it records
-the seed, hash kind, and the payload's byte order, so `WriteTo` always writes at
-host speed and `ReadFrom` byte-swaps only on the rare cross-endian load — **files
-are portable**. `WriteTo` bumps the version only when a field matters: an XXH3
-filter is written as v3 (still readable by v0.3.0), a non-XXH3 filter as v4.
+take minutes through `binary.Write`). The current format **v5** is self-describing:
+it records the seed, hash kind, and the payload's byte order, so `WriteTo` always
+writes at host speed and `ReadFrom` byte-swaps only on the rare cross-endian load
+— **v5 files are portable**.
 
-`ReadFrom` reads every historical version (v1–v4). To upgrade old files in bulk:
+⚠️ **Formats v1–v4 (`≤ v0.6.0`) are rejected.** They used a flawed in-block probe
+scheme with a different bit layout (see below); reinterpreting them under v5 would
+produce false negatives, so `ReadFrom` refuses them with a clear error rather than
+silently corrupting results. A Bloom filter can't be rebuilt from its bits, so such
+filters must be **regenerated from source data**.
 
-```
-go run ./cmd/convert old.bbf new.bbf      # any version -> current
-```
-
-| Format | Header | Stores | Portable |
+| Format | Header | Stores | Status |
 |---|---|---|---|
-| v1 (`v0.1.0`) | 24 B | numBlocks, k | no (LE only) |
-| v2 (`v0.2.0`) | 32 B | + seed | no (LE only) |
-| v3 (`v0.3.0`) | 40 B | + endianness tag | yes |
-| v4 (`v0.4.0`) | 40 B | + hash kind | yes |
+| v1–v4 (`≤ v0.6.0`) | 24–40 B | — | **rejected** (incompatible probe scheme) |
+| v5 (`v0.7.0`) | 40 B | endianness, hash kind, seed | current, portable |
 
 ## Security: hashing seed & threat model
 

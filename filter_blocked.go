@@ -203,28 +203,32 @@ func (f *BlockedFilter) blockOffset(data []byte) (off uint64, h1, h2 uint32) {
 	blockIdx := hi % f.numBlocks
 	off = blockIdx * blockWords
 	h1 = uint32(lo)
-	h2 = uint32(lo >> 32)
+	h2 = uint32(lo>>32) | 1 // odd stride: coprime with 512 so all k probes are distinct
 	return
 }
 
 // Add inserts data. Touches exactly one cache line.
 func (f *BlockedFilter) Add(data []byte) *BlockedFilter {
-	off, h1, h2 := f.blockOffset(data)
+	off, a, b := f.blockOffset(data)
 	for i := uint(0); i < f.k; i++ {
-		bit := (h1 + uint32(i)*h2) & blockMask
+		bit := a & blockMask
 		f.blocks[off+uint64(bit>>6)] |= 1 << (bit & 63)
+		a += b
+		b += uint32(i) // enhanced double hashing: triangular term breaks linear collisions
 	}
 	return f
 }
 
 // Test reports possible membership. Touches exactly one cache line.
 func (f *BlockedFilter) Test(data []byte) bool {
-	off, h1, h2 := f.blockOffset(data)
+	off, a, b := f.blockOffset(data)
 	for i := uint(0); i < f.k; i++ {
-		bit := (h1 + uint32(i)*h2) & blockMask
+		bit := a & blockMask
 		if f.blocks[off+uint64(bit>>6)]&(1<<(bit&63)) == 0 {
 			return false
 		}
+		a += b
+		b += uint32(i)
 	}
 	return true
 }
@@ -243,37 +247,28 @@ func (f *BlockedFilter) Hash() HashKind { return f.hash }
 
 // --- Serialization ---
 //
-// The wire format is self-describing. v3 and v4 share a 40-byte header:
-//   [8] magic   "BBLM\x0v\x00\x00\x00"   (byte 4 = format version)
+// The current format is v5 (40-byte self-describing header):
+//   [8] magic   "BBLM\x05\x00\x00\x00"   (byte 4 = format version)
 //   [1] payload endianness   0 = little, 1 = big
-//   [1] hash kind            (v4 only; v3 implies XXH3)
+//   [1] hash kind
 //   [6] reserved (zero)
 //   [8] numBlocks   (little-endian)
 //   [8] k           (little-endian)
 //   [8] seed        (little-endian)
 //   [numBlocks*64] raw bit array, one 64-byte cache line per block
 //
-// WriteTo bumps the version only when a field actually matters: an XXH3 filter
-// is written as v3 (still readable by older v0.3.0 code); a non-XXH3 filter is
-// written as v4 so older readers safely refuse it rather than mis-hashing.
-//
 // The payload is dumped raw for speed. WriteTo emits the host's byte order and
-// records it; ReadFrom byte-swaps on the rare cross-endian load, so v3/v4 files
-// are portable — unlike v1/v2.
+// records it; ReadFrom byte-swaps on the rare cross-endian load, so v5 files
+// are portable.
 //
-// ReadFrom reads every historical format:
-//   v1 (24-byte header): magic, numBlocks, k                 — seed 0, XXH3, LE
-//   v2 (32-byte header): + seed                              — XXH3, LE
-//   v3 (40-byte header): + endianness                        — XXH3
-//   v4 (40-byte header): + hash kind
-// Use cmd/convert to upgrade old files.
+// Formats v1–v4 (≤ v0.6.0) used a flawed in-block double-hashing probe scheme
+// and a DIFFERENT bit layout. v5 switched to enhanced double hashing, so old
+// files would yield false negatives if reinterpreted. ReadFrom therefore
+// REJECTS v1–v4 with a clear error rather than silently corrupting results —
+// such filters must be regenerated from source data (a Bloom filter cannot be
+// rebuilt from its bits alone).
 
-const (
-	blockedHdrV1 = 24
-	blockedHdrV2 = 32
-	blockedHdrV3 = 40
-	blockedHdrV4 = 40
-)
+const blockedHdrV5 = 40
 
 var blockedMagicPrefix = [4]byte{'B', 'B', 'L', 'M'}
 
@@ -291,20 +286,16 @@ func blocksAsBytes(blocks []uint64) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(&blocks[0])), len(blocks)*8)
 }
 
-// WriteTo writes the filter to w (v3 for XXH3, v4 otherwise). It returns the
-// number of bytes written. Wrap w in a bufio.Writer for disk/network.
+// WriteTo writes a v5 representation of the filter to w. It returns the number
+// of bytes written. Wrap w in a bufio.Writer for disk/network.
 func (f *BlockedFilter) WriteTo(w io.Writer) (int64, error) {
-	var hdr [blockedHdrV4]byte
+	var hdr [blockedHdrV5]byte
 	copy(hdr[0:4], blockedMagicPrefix[:])
-	if f.hash == XXH3 {
-		hdr[4] = 3 // back-compatible with v0.3.0 readers
-	} else {
-		hdr[4] = 4
-		hdr[9] = byte(f.hash)
-	}
+	hdr[4] = 5 // version
 	if nativeBigEndian {
 		hdr[8] = 1
 	}
+	hdr[9] = byte(f.hash)
 	binary.LittleEndian.PutUint64(hdr[16:24], f.numBlocks)
 	binary.LittleEndian.PutUint64(hdr[24:32], uint64(f.k))
 	binary.LittleEndian.PutUint64(hdr[32:40], f.seed)
@@ -318,9 +309,9 @@ func (f *BlockedFilter) WriteTo(w io.Writer) (int64, error) {
 	return total + int64(m), err
 }
 
-// ReadFrom reads any version (v1/v2/v3) written by this library, replacing the
-// receiver's contents. It returns the number of bytes read. Wrap r in a
-// bufio.Reader for disk/network.
+// ReadFrom reads a v5 filter written by this library, replacing the receiver's
+// contents. It returns the number of bytes read. Wrap r in a bufio.Reader for
+// disk/network. Files in formats v1–v4 are rejected (incompatible probe scheme).
 func (f *BlockedFilter) ReadFrom(r io.Reader) (int64, error) {
 	var magic [8]byte
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
@@ -330,47 +321,27 @@ func (f *BlockedFilter) ReadFrom(r io.Reader) (int64, error) {
 		return 8, fmt.Errorf("bloom: bad magic, not a blocked filter stream")
 	}
 	version := magic[4]
-
-	var restSize int
-	switch version {
-	case 1:
-		restSize = blockedHdrV1 - 8
-	case 2:
-		restSize = blockedHdrV2 - 8
-	case 3:
-		restSize = blockedHdrV3 - 8
-	case 4:
-		restSize = blockedHdrV4 - 8
+	switch {
+	case version == 5:
+		// current
+	case version >= 1 && version <= 4:
+		return 8, fmt.Errorf("bloom: blocked filter format v%d (written by <0.7.0) uses an "+
+			"incompatible probe scheme; regenerate it from source data", version)
 	default:
 		return 8, fmt.Errorf("bloom: unsupported blocked format version %d", version)
 	}
 
+	restSize := blockedHdrV5 - 8
 	rest := make([]byte, restSize)
 	if _, err := io.ReadFull(r, rest); err != nil {
 		return 8, err
 	}
 
-	var numBlocks, seed uint64
-	var k uint
-	payloadBig := false
-	hash := XXH3 // implicit for v1/v2/v3
-	switch version {
-	case 1:
-		numBlocks = binary.LittleEndian.Uint64(rest[0:8])
-		k = uint(binary.LittleEndian.Uint64(rest[8:16]))
-	case 2:
-		numBlocks = binary.LittleEndian.Uint64(rest[0:8])
-		k = uint(binary.LittleEndian.Uint64(rest[8:16]))
-		seed = binary.LittleEndian.Uint64(rest[16:24])
-	case 3, 4:
-		payloadBig = rest[0] == 1
-		if version == 4 {
-			hash = HashKind(rest[1])
-		}
-		numBlocks = binary.LittleEndian.Uint64(rest[8:16])
-		k = uint(binary.LittleEndian.Uint64(rest[16:24]))
-		seed = binary.LittleEndian.Uint64(rest[24:32])
-	}
+	payloadBig := rest[0] == 1
+	hash := HashKind(rest[1])
+	numBlocks := binary.LittleEndian.Uint64(rest[8:16])
+	k := uint(binary.LittleEndian.Uint64(rest[16:24]))
+	seed := binary.LittleEndian.Uint64(rest[24:32])
 
 	hasher, err := resolveHasher(hash)
 	if err != nil {
@@ -401,7 +372,7 @@ func swapWords(words []uint64) {
 // MarshalBinary implements encoding.BinaryMarshaler.
 func (f *BlockedFilter) MarshalBinary() ([]byte, error) {
 	var buf bytes.Buffer
-	buf.Grow(blockedHdrV4 + len(f.blocks)*8)
+	buf.Grow(blockedHdrV5 + len(f.blocks)*8)
 	if _, err := f.WriteTo(&buf); err != nil {
 		return nil, err
 	}
