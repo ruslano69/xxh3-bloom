@@ -5,7 +5,11 @@ the hash function. API-compatible with
 [`bits-and-blooms/bloom`](https://github.com/bits-and-blooms/bloom).
 
 At its core this is a **low-level optimization of the membership-lookup algorithm**:
-the same Bloom filter, but with its bits laid out for the CPU cache.
+the same Bloom filter, but with its bits laid out for the CPU cache. The library
+ships two such layouts — scalar blocked (512-bit) and SIMD split-block (256-bit,
+AVX2) — out of the broader family explored in
+[Cache-line strategies](#cache-line-strategies-research-in-benchrust):
+512- vs 256-bit blocks, AVX2 vs AVX-512.
 
 > **The honest one-liner:** the lookup speedup (~2.9×) comes from
 > **single-cache-line probing**, not from the choice of hash. XXH3 is an
@@ -18,6 +22,8 @@ the same Bloom filter, but with its bits laid out for the CPU cache.
 | `Filter` | [`filter.go`](filter.go) | Classic filter, XXH3 drop-in instead of MurmurHash3 |
 | `BlockedFilter` | [`filter_blocked.go`](filter_blocked.go) | All `k` bits of a key live in one 64-byte cache line → 1 cache miss instead of `k` |
 | `NewBlockedTuned` | [`filter_blocked.go`](filter_blocked.go) | Same, but the block count is numerically sized to hit the target FP (spend ~10% more RAM, get the accuracy back) |
+| `SimdFilter` | [`filter_simd.go`](filter_simd.go) | Split-block 256-bit (½ cache line, k=8 fixed): the membership test is ~5 AVX2 instructions. Fastest query path in the library |
+| `NewSimdTuned` | [`filter_simd.go`](filter_simd.go) | Same, block count sized to hit the target FP (~15% more RAM — the price of the split-block layout) |
 
 ## Where the speed comes from (and where it doesn't)
 
@@ -32,21 +38,54 @@ Measured on Intel i7-7700, 200M elements, 100% fill, FP target 1%:
 |---|---|---|---|---|---|
 | Murmur3 (original) | ~400 | 316 | 1.00 % | 0.24 GB | 7 |
 | **XXH3** (drop-in) | 400 | 316 | 1.00 % | 0.24 GB | 7 |
-| **Blocked-XXH3** | **138** | **136** | 1.44 % ⚠️ | 0.24 GB | **1** |
-| **Blocked-Tuned** | **141** | **138** | **1.01 %** ✅ | 0.26 GB | **1** |
+| **Blocked-XXH3** | **138** | **136** | 1.23 % ⚠️ | 0.24 GB | **1** |
+| **Blocked-Tuned** | **141** | **138** | **0.81 %** ✅ | 0.26 GB | **1** |
 
 Takeaways:
 - **XXH3 vs Murmur3 — a tie.** Once the filter doesn't fit in cache, hash choice
   is irrelevant.
 - **Blocked gives ~2.9×** by collapsing 7 cache misses into 1.
-- **Plain Blocked trades accuracy** (1.44 % instead of 1.00 %) because of uneven
+- **Plain Blocked trades accuracy** (1.23 % instead of 1.00 %) because of uneven
   block load (Poisson distribution of keys across blocks).
-- **Blocked-Tuned** brings accuracy back to target at the cost of **+10 % memory** —
-  the best balance when you have spare RAM.
+- **Blocked-Tuned** brings accuracy to target (here ~0.81 %, at/under 1 %) at the
+  cost of **+10 % memory** — the best balance when you have spare RAM.
 
 On *small* filters (those that fit in L3, < ~700K elements at 1% FP) XXH3 really is
 a bit faster than Murmur3 (~10–15 % on short keys), because there computation
 dominates rather than memory. That shows up in the micro-benchmarks.
+
+### Head-to-head vs `bits-and-blooms`
+
+A fresh run on a Ryzen 9 7900X (Zen 4), 50M elements, 100% fill, 10M queries, FP
+target 1% (`go run ./cmd/e2e -capacity 50000000 -fill 100 -queries 10000000
+-compare -blocked -tuned`):
+
+| Tier | Fill ns | Query TP ns | Query TN ns | FP rate |
+|---|---|---|---|---|
+| `bits-and-blooms` (Murmur3) | 160 | 144 | 150 | 1.00 % |
+| classic `Filter` (XXH3) | 153 | 138 | 144 | 1.00 % |
+| **Blocked-XXH3** | **53** | **50** | **56** | 1.22 % ⚠️ |
+| **Blocked-Tuned** | **54** | **53** | **57** | **0.81 %** ✅ |
+
+Same story as the older box, larger margin: the blocked tiers are **~2.7× faster**
+than `bits-and-blooms` on the query path, at the cost of accuracy (plain) or +10%
+memory (tuned). Classic XXH3 vs Murmur3 is a wash, as expected.
+
+The batch path widens it further. On a 20M-key out-of-cache query
+(`BenchmarkBlockedTestBatch` vs `BenchmarkBlockedTestLoop`):
+
+| Path | ns/op | vs library |
+|---|---|---|
+| `bits-and-blooms` `Test` loop | 144 | 1× |
+| Blocked `Test` loop | 33.9 | 4.2× |
+| **Blocked `TestBatch`** | **14.3** | **~10×** |
+| **Simd `TestBatch`** | **12.8** | **~11×** |
+
+Prefetch + memory-level parallelism turns the single-cache-line layout into a ~2.4×
+gain over the already-fast scalar blocked loop. Layering the **SIMD split-block**
+filter on top — half-cache-line blocks plus a ~5-instruction AVX2 probe — shaves
+another ~11% off (12.8 vs 14.3 ns, ranges disjoint under `benchstat`), making
+`SimdFilter.TestBatch` the fastest query path the library offers.
 
 ## The "convenient property" of XXH3 we rely on
 
@@ -54,13 +93,18 @@ Not speed. We rely on the fact that **a single alloc-free `xxh3.Hash128` call ha
 back exactly the shape of data a blocked filter needs**:
 
 ```go
-h := xxh3.Hash128(data)        // one call, zero allocations, 128 bits
-blockIdx := h.Hi % numBlocks   // high 64 bits → pick the cache line
-a := uint32(h.Lo)              // low 64 bits, lower half
-b := uint32(h.Lo>>32) | 1      //              upper half (odd stride)
+h := xxh3.Hash128(data)            // one call, zero allocations, 128 bits
+blockIdx, _ := bits.Mul64(h.Hi, numBlocks) // high 64 bits → cache line (fastrange)
+a := uint32(h.Lo)                  // low 64 bits, lower half
+b := uint32(h.Lo>>32) | 1          //              upper half (odd stride)
 // k positions inside the block via enhanced double hashing (Dillinger-Manolios):
 //   bit_i = a & 511; then a += b; b += i
 ```
+
+The block index uses **fastrange** (Lemire): `(h.Hi * n) >> 64` via a single
+widening multiply, replacing a 64-bit modulo on the hot path. It maps the hash
+uniformly onto `[0, numBlocks)` without requiring the block count to be a power of
+two — so it stays free to be the tuned value, not the next power of two up.
 
 So from one hash we get both the **block index** and the two seeds for the in-block
 probe sequence for free — no second pass over the data, no heap. The classic
@@ -89,6 +133,12 @@ b := bloom.NewBlocked(1_000_000, 0.01)
 
 // Cache-local + exact FP (you have spare RAM)
 t := bloom.NewBlockedTuned(1_000_000, 0.01)
+
+// Fastest query path (SIMD split-block, AVX2 where available, else scalar)
+sf := bloom.NewSimd(1_000_000, 0.01)
+sf.AddBatch(keys)             // batch fill/lookup is where it shines
+sf.TestBatch(keys, out)
+st := bloom.NewSimdTuned(1_000_000, 0.01)  // + ~15% RAM to hit the FP target
 
 // Configured with options (seed, hash)
 seed := bloom.RandomSeed()                 // crypto-random, keep it secret
@@ -127,7 +177,15 @@ Picking a tier (by resources):
 Memory-constrained, accuracy critical   → Filter (classic)
 Have RAM, need throughput               → NewBlockedTuned
 Accuracy not critical, want raw speed   → NewBlocked
+Bulk lookups, want the fastest query    → NewSimd + TestBatch  (amd64/AVX2)
 ```
+
+`SimdFilter` is the speed ceiling but the least flexible tier: `k` is fixed at 8
+(one bit per 32-bit lane), it has **no serialization** (rebuild from source on
+restart), and its accuracy tradeoff is slightly worse than the scalar blocked
+filter (the split-block layout, below). Reach for it when bulk throughput is the
+goal and the keys are regenerable; otherwise the blocked tiers are the safer
+default.
 
 ### Choosing by trust boundary
 
@@ -169,13 +227,19 @@ loaded.ReadFrom(bufio.NewReader(fd2))
 ```
 
 The bit array is dumped raw via `unsafe` (no reflection — a GB-scale filter would
-take minutes through `binary.Write`). The current format **v5** is self-describing:
-it records the seed, hash kind, and the payload's byte order, so `WriteTo` always
-writes at host speed and `ReadFrom` byte-swaps only on the rare cross-endian load
-— **v5 files are portable**.
+take minutes through `binary.Write`). The current format **v6** is self-describing:
+it records the seed, hash kind, the **block-index mode** (modulo vs fastrange), and
+the payload's byte order, so `WriteTo` always writes at host speed and `ReadFrom`
+byte-swaps only on the rare cross-endian load — **v6 files are portable**.
+
+The block-index mode is stored because the on-disk bit layout depends on it: the
+reader must pick blocks with the same function used at write time. New filters
+default to **fastrange** (a widening multiply + shift instead of a 64-bit modulo).
+**v5 files still load** — their (previously reserved) mode byte is zero, which
+reads as modulo, exactly how v5 filters were built.
 
 ⚠️ **Formats v1–v4 (`≤ v0.6.0`) are rejected.** They used a flawed in-block probe
-scheme with a different bit layout (see below); reinterpreting them under v5 would
+scheme with a different bit layout (see below); reinterpreting them would
 produce false negatives, so `ReadFrom` refuses them with a clear error rather than
 silently corrupting results. A Bloom filter can't be rebuilt from its bits, so such
 filters must be **regenerated from source data**.
@@ -183,7 +247,31 @@ filters must be **regenerated from source data**.
 | Format | Header | Stores | Status |
 |---|---|---|---|
 | v1–v4 (`≤ v0.6.0`) | 24–40 B | — | **rejected** (incompatible probe scheme) |
-| v5 (`v0.7.0`) | 40 B | endianness, hash kind, seed | current, portable |
+| v5 (`v0.7.0`) | 40 B | endianness, hash kind, seed | readable (loads as modulo) |
+| v6 (current) | 40 B | + block-index mode (modulo/fastrange) | current, portable |
+
+### Batch API (blocked and SIMD tiers)
+
+For bulk insert/lookup, `AddBatch`/`TestBatch` beat a loop of `Add`/`Test` once
+the filter spills out of cache (both `BlockedFilter` and `SimdFilter` expose them):
+
+```go
+keys := [][]byte{key0, key1, key2 /* … */}
+f.AddBatch(keys)
+
+out := make([]bool, len(keys))
+f.TestBatch(keys, out)         // out[i] is the answer for keys[i]
+```
+
+They process keys in a small window: first hash every key in the window and
+**software-prefetch** its cache line, then run the k-probes. Issuing the
+prefetches before the dependent loads keeps several cache misses in flight at once
+(memory-level parallelism) instead of one strictly serial miss per lookup. The bit
+layout is identical to the scalar path — `AddBatch` lays down exactly the bits an
+`Add` loop would. The prefetch hint is a `PREFETCHT0` stub on `amd64`; other
+architectures fall back to the two-phase structure alone (still some MLP via
+out-of-order execution). Measured ~2.4× on a 20M-key out-of-cache query
+(see the table below).
 
 ## Security: hashing seed & threat model
 
@@ -228,6 +316,58 @@ cache-penetration flood, against an embedded miniredis (no Docker) — lives in
 [`examples/cache-penetration`](examples/cache-penetration). It blocks 99.7% of a
 500k-key attack before it leaves the process.
 
+## Applications & caveats
+
+The filter fits one shape of problem well: an **in-memory pre-filter in front of an
+expensive resource** (a DB behind a cache, a backend behind a proxy) at high RPS,
+where a `~140 ns` check saves a `µs`-scale network/disk trip for keys that are
+provably absent. The runnable Redis example is in
+[`examples/cache-penetration`](examples/cache-penetration). But the failure modes
+decide whether it helps or hurts:
+
+- **Direction of the false positive matters.** Use it as a **fail-open whitelist**
+  (not in the set → take the cheap path / return absent): a FP only ever costs a
+  wasted lookup, never a wrong "no". The inverse — a **blacklist that drops on a
+  hit** — is dangerous: a FP there silently blocks a *legitimate* user. If you must
+  block on presence, follow a `true` with an exact check.
+- **`Test` is concurrency-safe only when nothing is calling `Add`.** Reads race
+  against the in-place `|=` of a write. Load-once-then-read-only is fine; a filter
+  updated live under traffic needs an external lock or an atomic pointer swap
+  (build a new filter, swap it in). The filter has **no internal locking**.
+- **No deletion.** You cannot remove a key — a changing set (un-bans, expiring
+  entries) means rebuilding the filter, or using a counting/cuckoo filter instead.
+- **Attacker-chosen keys → `Secured`.** If keys come from outside, a known fixed
+  hash lets an attacker craft inputs that saturate one block and drive its FP up,
+  defeating the guard. `Secured(RandomSeed())` (SipHash + secret seed) makes those
+  collisions unpredictable. This is the same defense Redis itself uses (see below).
+- **`140 ns` is single-op latency, not throughput.** High RPS comes from running
+  reads concurrently across cores (safe, per the point above).
+
+### The other profile: certificate revocation (size-bound, not speed-bound)
+
+The most famous Bloom deployment — [CRLite](https://blog.mozilla.org/security/2020/01/09/crlite-part-3-speeding-up-secure-browsing/)
+in Firefox — is the *opposite* of the cache case, and worth calling out because it
+flips the tier choice:
+
+- **Bloom's no-false-negatives is exactly the safety property here.** The set is
+  *revoked* certs; a revoked cert is therefore **never missed**. The cost is the
+  inverse FP — a valid cert wrongly flagged revoked — which is an *availability*
+  cost, not a security hole.
+- **Drive FP to zero with a Bloom filter cascade.** Because the universe of certs is
+  known and closed (Certificate Transparency logs), CRLite layers filters: level 0
+  holds the revoked set, its false positives over the valid set go into level 1,
+  *its* false positives into level 2, and so on until none remain — **zero FP and
+  zero FN over the enrolled universe**. (Over an *open* set of arbitrary queries the
+  cascade gives no such guarantee.)
+- **For this, use the classic `Filter`, not the blocked tiers.** Revocation is
+  **size-bound** (the filter is shipped to many clients and queried rarely), the
+  opposite of high-RPS lookup. The blocked/SIMD tiers trade memory for speed —
+  the wrong trade here; minimum memory wins. `Secured` is also unnecessary: certs
+  are CA-signed, so queries can't be crafted to poison a block.
+- This library ships a **single** filter — a cascade is a layer you'd build on top
+  of several of them; we don't provide it (yet). "Load once, read-only, rebuild each
+  period" matches how a CRL is reissued, so the no-deletion limit is a non-issue.
+
 ## Reproduce the benchmarks
 
 ```bash
@@ -246,6 +386,87 @@ hash/algorithm, and to compare against the SipHash-based `bloomfilter` crate)
 lives in [`bench/rust`](bench/rust). The false-positive counts match Go
 bit-for-bit, and at an identical hash+algorithm Rust comes out ~1.2–1.6× ahead —
 real but not order-of-magnitude, and smallest on the memory-bound query paths.
+
+## Cache-line strategies (research, in `bench/rust`)
+
+The Go library ships two cache-aware layouts: the scalar **blocked** filter (512-bit
+line, 1 miss) and the **SIMD split-block** `simd` (256-bit, AVX2). But "one cache
+line" is not a single design — it's a small **family of layouts** trading speed,
+accuracy, and how much of the line you use. We explored the rest of that family in
+Rust (easier to drop to intrinsics); the `simd512`/`avx512` modes below are
+**Rust-only experiments, not in the Go API**:
+
+| Layout | Block | Cache miss | Mask build | Notes |
+|---|---|---|---|---|
+| scalar blocked | 512-bit | 1 | — | Go: `BlockedFilter` |
+| SIMD split-block (`simd`) | 256-bit (½ line) | 1 | vector (`mullo_epi32`) | Go: `SimdFilter` (AVX2). Fastest; FP a bit higher |
+| SIMD split-block (`simd512`) | 512-bit (1 line) | 1 | **scalar** (AVX2 has no `mullo_epi64`) | Rust only. Scalar-blocked accuracy, faster fill |
+| SIMD split-block (`avx512`) | 512-bit (1 line) | 1 | **vector** (`mullo_epi64`, AVX-512DQ) | Rust only. Full-line block, mask built in one register |
+
+### The Go `SimdFilter`: layout, accuracy, and the AVX2 path
+
+The Go `SimdFilter` is the `simd` row above, ported to a hand-written AVX2 stub
+([`simd_amd64.s`](simd_amd64.s)) with a scalar fallback for non-amd64. A 256-bit
+block is 8 lanes of 32 bits with **exactly one bit set per lane**, so `k` is fixed
+at 8: one `xxh3.Hash128` picks the block (`Hi % numBlocks`), and the low 32 bits
+seed all 8 lane positions (`idx = (key32 * salt[lane]) >> 27`). The whole probe is
+~5 AVX2 instructions (`VPMULLD`/`VPSRLD`/`VPSLLVD` to build the mask, then `VPANDN`
++ `VPTEST` to test containment). A bit-exactness test asserts the AVX2 path lays down
+**byte-for-byte the same blocks** as the scalar reference.
+
+The split-block layout trades a little accuracy for that speed. One-bit-per-lane
+constrains where bits can land, so for equal memory the false-positive rate runs a
+touch hotter than the scalar blocked filter:
+
+| Tier | Mem vs plain | Measured FP (1% target) |
+|---|---|---|
+| `NewSimd` (plain) | baseline | ~1.5 % ⚠️ |
+| `NewSimd` +10% blocks | +10 % | ~1.0 % |
+| `NewSimdTuned` | +~15 % | **0.81 %** ✅ |
+
+`NewSimdTuned` sizes the block count to hit the target (vs ~10% for the scalar
+`NewBlockedTuned` — the extra ~5% is the price of the split-block layout). Use
+plain `NewSimd` when a ~1.5% rate is fine and you want the memory; tuned when you
+need the target FP and have the RAM.
+
+Measured on Intel i7-7700 (AVX2), 200M elements, same memory:
+
+| Layout | Fill ns/op | Query TP ns | FP |
+|---|---|---|---|
+| `simd` (256-bit) | **51** | **62** | 1.52 % |
+| `simd512` (512-bit) | 70 | 74 | 1.28 % |
+| scalar blocked | 129 | 78 | 1.23 % |
+
+The lesson is the project thesis, sharpened: SIMD removes ~85 % of the per-lookup
+CPU work but lookups only get ~25 % faster — because the query path is
+**memory-latency-bound**, so the saved compute hides behind the cache miss. SIMD's
+big win lands on the throughput-bound **fill** path instead (2.5×). And the layout
+is **platform-bound**: 256-bit blocks vectorize the mask cleanly on AVX2, but a
+full-line 512-bit block needs a 64-bit-lane multiply — `mullo_epi64`, which arrives
+only with AVX-512DQ (e.g. Zen 4). The `avx512` mode does exactly that: it builds the
+whole 512-bit line's mask in one register (`_mm512_mullo_epi64` + `sllv`), where
+AVX2's `simd512` had to fall back to scalar. On a 128-byte-cache-line CPU (Apple
+Silicon) the block-vs-line ratio shifts again.
+See [`bench/rust/README.md`](bench/rust/README.md) for the full tradeoff triangle.
+
+### Honest Go vs Rust on the SIMD path
+
+Both implementations lay out identical bits, so this isolates the language/codegen
+gap on the *same* Ryzen 9 7900X at 50M elements (out of L3):
+
+| Path | Go (`SimdFilter`) | Rust (`simd`) | Gap |
+|---|---|---|---|
+| single-op query | 45 ns | 22 ns | ~2× Rust |
+| batch query (prefetch window 32) | 14.5 ns | **8.0 ns** | ~1.8× Rust |
+
+Two honest takeaways. First, **Go's batch path (14.5 ns) beats Rust's single-op
+query (22 ns)** — but only because the prefetch+MLP structure does the heavy
+lifting; it's an algorithmic win, not a codegen one. Second, once *both* sides
+batch, the **~2× per-op gap carries straight into the batch regime** (8.0 vs 14.5):
+Rust's tighter codegen on the AVX2 inner loop is the residual difference. The Go
+filter is the fastest thing *this library* offers; Rust at an identical algorithm
+is still ~1.8–2× ahead, consistent with the ~1.2–1.6× language gap seen on the
+scalar paths, widened by the hand-tuned intrinsics.
 
 ## Origin of the idea
 

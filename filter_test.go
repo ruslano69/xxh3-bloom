@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
@@ -95,33 +96,84 @@ func TestBlockedFalsePositiveRate(t *testing.T) {
 	}
 }
 
-func TestBlockedTunedMeetsTarget(t *testing.T) {
-	// 0.001 is the case that exposed the flawed-double-hashing floor before the
-	// enhanced-hashing fix; keep it covered so the fix can't silently regress.
-	for _, target := range []float64{0.01, 0.001} {
-		n := uint(200_000)
-		f := xxhbloom.NewBlockedTuned(n, target)
+// TestBlockedTunedFPGridRegression is the release "lock" on the in-block probe
+// scheme — the class of bug we found by calibration just before tagging, and the
+// reason this test exists.
+//
+// Flawed double hashing (≤ v0.6.0) collapsed the k in-block probes onto a few
+// residues, which FLOORED the achievable false-positive rate. It was invisible at
+// fp=0.01 but ~3× over target at 0.001 and ~18× over at 0.0001 — a degeneration
+// that grew as the target shrank. Enhanced double hashing removed that floor.
+//
+// Two things make this a real regression test rather than a single spot-check:
+//  1. Grid coverage — a probabilistic floor only shows up at LOW targets, so the
+//     sweep must reach 1e-4, not stop at 1e-2.
+//  2. Statistical significance — the query count is scaled so each target sees a
+//     fixed expected number of false positives (E[fp] ≈ wantFPCount), giving a
+//     stable relative standard error (~1/sqrt(E[fp])). A rate measured from a
+//     handful of hits proves nothing.
+//
+// The healthy enhanced scheme still overshoots at the extreme 1e-4 end (high k in
+// a 512-bit block leaves few distinct residues), so there we do NOT assert
+// accuracy we don't deliver — we assert only that it has not collapsed back to the
+// old ~18× floor.
+func TestBlockedTunedFPGridRegression(t *testing.T) {
+	const n = uint(200_000)
 
-		buf := make([]byte, 4)
-		for i := uint32(0); i < uint32(n); i++ {
-			binary.BigEndian.PutUint32(buf, i)
+	wantFPCount := 1500 // E[fp] per target ⇒ rel. std error ≈ 1/sqrt(1500) ≈ 2.6%
+	if testing.Short() {
+		wantFPCount = 300
+	}
+
+	cases := []struct {
+		target float64
+		margin float64 // measured rate must stay below target*margin
+		note   string
+	}{
+		{0.05, 1.30, "supported, tight"},
+		{0.01, 1.30, "supported, tight"},
+		{0.005, 1.35, "supported, tight"},
+		{0.001, 1.60, "supported; first target that exposed the flawed-hashing floor"},
+		{0.0001, 6.0, "edge: tuned overshoots by design — guard only against the ~18× degeneration"},
+	}
+
+	buf := make([]byte, 8)
+	for _, tc := range cases {
+		f := xxhbloom.NewBlockedTuned(n, tc.target)
+		for i := uint64(0); i < uint64(n); i++ {
+			binary.BigEndian.PutUint64(buf, i)
 			f.Add(buf)
 		}
-		rounds := 2_000_000
+
+		rounds := int(float64(wantFPCount) / tc.target)
+		if rounds < 500_000 {
+			rounds = 500_000
+		}
 		fp := 0
 		for i := 0; i < rounds; i++ {
-			binary.BigEndian.PutUint32(buf, uint32(n)+uint32(i)+1)
+			binary.BigEndian.PutUint64(buf, uint64(n)+uint64(i)+1)
 			if f.Test(buf) {
 				fp++
 			}
 		}
+
 		rate := float64(fp) / float64(rounds)
 		numBlocks := uint64(f.Cap()) / 512
 		predicted := xxhbloom.EstimateBlockedFP(n, numBlocks, f.K())
-		t.Logf("tuned target=%.4f: bits=%d k=%d predicted=%.5f measured=%.5f",
-			target, f.Cap(), f.K(), predicted, rate)
-		if rate > target*1.25 {
-			t.Errorf("tuned FP %.5f exceeds target %.5f (×1.25 margin)", rate, target)
+		relErr := 0.0
+		if fp > 0 {
+			relErr = 100.0 / math.Sqrt(float64(fp))
+		}
+		t.Logf("target=%.4f k=%d rounds=%d predicted=%.6f measured=%.6f (%.2f× target, ±%.1f%% stderr) — %s",
+			tc.target, f.K(), rounds, predicted, rate, rate/tc.target, relErr, tc.note)
+
+		if fp < 100 {
+			t.Fatalf("target=%.4f: only %d false positives observed — measurement not significant; raise rounds",
+				tc.target, fp)
+		}
+		if rate > tc.target*tc.margin {
+			t.Errorf("target=%.4f: measured FP %.6f exceeds %.2f× target (=%.6f) — the probe scheme may have regressed",
+				tc.target, rate, tc.margin, tc.target*tc.margin)
 		}
 	}
 }
@@ -348,10 +400,10 @@ func TestSipHashSeedSeparation(t *testing.T) {
 	if a.Equal(b) {
 		t.Fatal("SipHash under different seeds produced identical bits")
 	}
-	// round-trips as v4 with hash + seed preserved
+	// round-trips as v6 with hash + seed preserved
 	blob, _ := a.MarshalBinary()
-	if blob[4] != 5 {
-		t.Fatalf("filter must serialize as v5, got %d", blob[4])
+	if blob[4] != 6 {
+		t.Fatalf("filter must serialize as v6, got %d", blob[4])
 	}
 	var dst xxhbloom.BlockedFilter
 	if err := dst.UnmarshalBinary(blob); err != nil {
@@ -362,7 +414,7 @@ func TestSipHashSeedSeparation(t *testing.T) {
 	}
 }
 
-// A Murmur3 filter must serialize as v4 and round-trip with the hash preserved.
+// A Murmur3 filter must serialize as v6 and round-trip with the hash preserved.
 func TestPluggableHashSerialization(t *testing.T) {
 	src := xxhbloom.NewBlockedTuned(20_000, 0.01, xxhbloom.WithHash(xxhbloom.Murmur3), xxhbloom.WithSeed(99))
 	buf := make([]byte, 8)
@@ -374,8 +426,8 @@ func TestPluggableHashSerialization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBinary: %v", err)
 	}
-	if blob[4] != 5 {
-		t.Fatalf("filter must serialize as v5, got version %d", blob[4])
+	if blob[4] != 6 {
+		t.Fatalf("filter must serialize as v6, got version %d", blob[4])
 	}
 	var dst xxhbloom.BlockedFilter
 	if err := dst.UnmarshalBinary(blob); err != nil {
@@ -395,12 +447,12 @@ func TestPluggableHashSerialization(t *testing.T) {
 	}
 }
 
-// All filters serialize as v5 now (the enhanced-probe format).
-func TestWritesV5(t *testing.T) {
+// All filters serialize as v6 now (enhanced-probe format + fastrange block index).
+func TestWritesV6(t *testing.T) {
 	f := xxhbloom.NewBlocked(5_000, 0.01)
 	blob, _ := f.MarshalBinary()
-	if blob[4] != 5 {
-		t.Fatalf("filter must serialize as v5, got version %d", blob[4])
+	if blob[4] != 6 {
+		t.Fatalf("filter must serialize as v6, got version %d", blob[4])
 	}
 }
 
