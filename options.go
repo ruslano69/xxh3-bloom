@@ -32,3 +32,18 @@ func WithSeed(seed uint64) Option {
 func WithHash(kind HashKind) Option {
 	return func(c *config) { c.hash = kind }
 }
+
+// Secured bundles the recommended options for a filter exposed to untrusted
+// input: it keys the hash with seed and selects SipHash, the DoS-resistant PRF.
+// Pass a secret seed (e.g. RandomSeed()); it is stored in the serialized form,
+// so reloads restore it automatically.
+//
+// For internal/trusted keys, pass no options — the default (XXH3, unseeded) is
+// the fastest path and has nothing to protect against. See the package doc's
+// "Choosing by trust boundary".
+func Secured(seed uint64) Option {
+	return func(c *config) {
+		c.seed = seed
+		c.hash = SipHash
+	}
+}

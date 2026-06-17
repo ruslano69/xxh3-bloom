@@ -114,13 +114,37 @@ that alone does not make the filters bit-compatible** — true interop also requ
 the same location formula, bit layout, and m/k rounding. Treat `WithHash` as
 "choose the hashing primitive," not "drop-in interop with library X."
 
-Picking a tier:
+Picking a tier (by resources):
 
 ```
 Memory-constrained, accuracy critical   → Filter (classic)
 Have RAM, need throughput               → NewBlockedTuned
 Accuracy not critical, want raw speed   → NewBlocked
 ```
+
+### Choosing by trust boundary
+
+The security config follows one rule: **who supplies the keys?** Speed is safe
+for internal APIs — pick the fastest tier at adequate accuracy. Switch to the
+secured variant the moment keys come from a published, externally reachable
+surface.
+
+| Keys come from | Use | Why |
+|---|---|---|
+| **Internal** — IDs you generate, file paths, cache keys | default (XXH3, unseeded) | nothing to attack; take the speed |
+| **Public** — anything an external caller chooses | `Secured(RandomSeed())` | a known hash can be poisoned; key it |
+
+```go
+// Internal API: fastest path
+f := bloom.NewBlockedTuned(n, fp)
+
+// Public API: keyed + SipHash in one option
+f := bloom.NewBlockedTuned(n, fp, bloom.Secured(bloom.RandomSeed()))
+```
+
+`Secured` is shorthand for `WithSeed(seed) + WithHash(SipHash)`. If you only need
+to defeat offline precomputation cheaply (and skip SipHash's cost), use
+`WithSeed(secret)` alone — see [Security](#security-hashing-seed--threat-model).
 
 ### Serialization (blocked tiers only)
 

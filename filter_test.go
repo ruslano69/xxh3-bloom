@@ -360,6 +360,19 @@ func TestDifferentHashDiffersBits(t *testing.T) {
 	}
 }
 
+// Secured must bundle a seed + SipHash (the public-API recommendation).
+func TestSecuredOption(t *testing.T) {
+	f := xxhbloom.NewBlocked(1000, 0.01, xxhbloom.Secured(0x1234))
+	if f.Hash() != xxhbloom.SipHash || f.Seed() != 0x1234 {
+		t.Fatalf("Secured: hash=%v seed=%#x, want SipHash/0x1234", f.Hash(), f.Seed())
+	}
+	// a later explicit option still wins (options apply in order)
+	g := xxhbloom.NewBlocked(1000, 0.01, xxhbloom.Secured(1), xxhbloom.WithHash(xxhbloom.XXH3))
+	if g.Hash() != xxhbloom.XXH3 {
+		t.Fatalf("later option should override Secured: got %v", g.Hash())
+	}
+}
+
 // SipHash's DoS resistance comes from the secret seed: the same keys under two
 // different seeds must land on different bits, or an attacker could precompute
 // poisoning inputs regardless of the secret.
