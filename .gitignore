@@ -1,0 +1,7 @@
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# serialized filters produced by the e2e/demo runs
+*.bbf
