@@ -35,17 +35,17 @@ Measured on Intel i7-7700, 200M elements, 100% fill, FP target 1%:
 |---|---|---|---|---|---|
 | Murmur3 (original) | ~400 | 316 | 1.00 % | 0.24 GB | 7 |
 | **XXH3** (drop-in) | 400 | 316 | 1.00 % | 0.24 GB | 7 |
-| **Blocked-XXH3** | **138** | **136** | 1.44 % ⚠️ | 0.24 GB | **1** |
-| **Blocked-Tuned** | **141** | **138** | **1.01 %** ✅ | 0.26 GB | **1** |
+| **Blocked-XXH3** | **138** | **136** | 1.23 % ⚠️ | 0.24 GB | **1** |
+| **Blocked-Tuned** | **141** | **138** | **0.81 %** ✅ | 0.26 GB | **1** |
 
 Takeaways:
 - **XXH3 vs Murmur3 — a tie.** Once the filter doesn't fit in cache, hash choice
   is irrelevant.
 - **Blocked gives ~2.9×** by collapsing 7 cache misses into 1.
-- **Plain Blocked trades accuracy** (1.44 % instead of 1.00 %) because of uneven
+- **Plain Blocked trades accuracy** (1.23 % instead of 1.00 %) because of uneven
   block load (Poisson distribution of keys across blocks).
-- **Blocked-Tuned** brings accuracy back to target at the cost of **+10 % memory** —
-  the best balance when you have spare RAM.
+- **Blocked-Tuned** brings accuracy to target (here ~0.81 %, at/under 1 %) at the
+  cost of **+10 % memory** — the best balance when you have spare RAM.
 
 On *small* filters (those that fit in L3, < ~700K elements at 1% FP) XXH3 really is
 a bit faster than Murmur3 (~10–15 % on short keys), because there computation

@@ -48,13 +48,12 @@ Blocked tier (our approach):
 
 | Impl | Fill ns/op | Query TP | Query TN | FP |
 |---|---|---|---|---|
-| Go (ours) | 138 | 136 | 98 | 1.441 % |
-| Rust (ours) | 86 | 125 | 90 | 1.441 % |
+| Go (ours) | 138 | 136 | 98 | 1.23 % |
+| Rust (ours) | 86 | 125 | 90 | 1.23 % |
 
-(These blocked numbers predate the v0.7.0 enhanced-double-hashing fix; throughput
-is unchanged — the probe step costs the same — but the measured FP is now lower
-and closer to target. The Go↔Rust timing comparison, the point of this table, is
-unaffected.)
+(FP is post-v0.7.0 enhanced double hashing and is identical Go↔Rust, as expected —
+same algorithm, same hash. The fix did not change throughput: the probe step costs
+the same, so the timing comparison — the point of this table — is unchanged.)
 
 ## SIMD experiment (AVX2, Intel i7-7700, 200M elements, 100% fill, same memory ≈ 0.24 GB)
 
