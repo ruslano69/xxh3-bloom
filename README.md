@@ -219,6 +219,11 @@ measured in [`bench/rust`](bench/rust) (~1.8×) — but now it's a one-line opti
 rather than a different library. **SipHash without a seed gives no DoS
 resistance** — the seed is its key.
 
+A runnable end-to-end demo of this — defending a Redis-backed service from a
+cache-penetration flood, against an embedded miniredis (no Docker) — lives in
+[`examples/cache-penetration`](examples/cache-penetration). It blocks 99.7% of a
+500k-key attack before it leaves the process.
+
 ## Reproduce the benchmarks
 
 ```bash
