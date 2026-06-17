@@ -1,143 +1,146 @@
-# bloom — cache-local Bloom filter (эксперимент)
+# bloom — cache-local Bloom filter
 
-Альтернативная реализация фильтра Блума на Go с акцентом на **скорость поиска за счёт
-локальности памяти**, а не за счёт хеш-функции. Совместима по API с
+A Go Bloom filter focused on **lookup speed through memory locality**, not through
+the hash function. API-compatible with
 [`bits-and-blooms/bloom`](https://github.com/bits-and-blooms/bloom).
 
-По сути это **низкоуровневая оптимизация алгоритма проверки совпадения** (membership
-lookup): тот же фильтр Блума, но с раскладкой бит под архитектуру кеша CPU.
+At its core this is a **low-level optimization of the membership-lookup algorithm**:
+the same Bloom filter, but with its bits laid out for the CPU cache.
 
-> **Честная суть в одну строку:** ускорение поиска (~2.9×) даёт не выбор хеша, а
-> **single-cache-line probing**. XXH3 — это удобная *деталь реализации*, а не
-> источник скорости.
+> **The honest one-liner:** the lookup speedup (~2.9×) comes from
+> **single-cache-line probing**, not from the choice of hash. XXH3 is an
+> *implementation detail*, not the source of speed.
 
-## Что внутри
+## What's inside
 
-| Тир | Файл | Идея |
+| Tier | File | Idea |
 |---|---|---|
-| `Filter` | [`filter.go`](filter.go) | Классический фильтр, дроп-ин на XXH3 вместо MurmurHash3 |
-| `BlockedFilter` | [`filter_blocked.go`](filter_blocked.go) | Все `k` бит ключа лежат в одной 64-байтной cache line → 1 промах кеша вместо `k` |
-| `NewBlockedTuned` | [`filter_blocked.go`](filter_blocked.go) | То же, но число блоков численно подобрано под целевой FP (тратим ~10% RAM, возвращаем точность) |
+| `Filter` | [`filter.go`](filter.go) | Classic filter, XXH3 drop-in instead of MurmurHash3 |
+| `BlockedFilter` | [`filter_blocked.go`](filter_blocked.go) | All `k` bits of a key live in one 64-byte cache line → 1 cache miss instead of `k` |
+| `NewBlockedTuned` | [`filter_blocked.go`](filter_blocked.go) | Same, but the block count is numerically sized to hit the target FP (spend ~10% more RAM, get the accuracy back) |
 
-## Откуда берётся скорость (и откуда — нет)
+## Where the speed comes from (and where it doesn't)
 
-Эксперимент начинался с гипотезы «заменим Murmur3 на XXH3 — станет быстрее».
-Мы её **проверили и опровергли**: на больших фильтрах (вне L3-кеша) узкое место —
-не вычисление хеша, а случайный доступ к памяти. Хеш-функция там не видна.
+This started as the hypothesis "swap MurmurHash3 for XXH3 and it'll be faster."
+We **tested it and disproved it**: on large filters (out of the L3 cache) the
+bottleneck is not computing the hash, it's the random memory access. The hash
+function is invisible there.
 
-Измерено на Intel i7-7700, 200M элементов, 100% заполнение, FP target 1%:
+Measured on Intel i7-7700, 200M elements, 100% fill, FP target 1%:
 
-| Тир | Fill ns/op | Query ns/op | FP rate | Память | Cache misses / op |
+| Tier | Fill ns/op | Query ns/op | FP rate | Memory | Cache misses / op |
 |---|---|---|---|---|---|
-| Murmur3 (оригинал) | ~400 | 316 | 1.00 % | 0.24 GB | 7 |
-| **XXH3** (дроп-ин) | 400 | 316 | 1.00 % | 0.24 GB | 7 |
+| Murmur3 (original) | ~400 | 316 | 1.00 % | 0.24 GB | 7 |
+| **XXH3** (drop-in) | 400 | 316 | 1.00 % | 0.24 GB | 7 |
 | **Blocked-XXH3** | **138** | **136** | 1.44 % ⚠️ | 0.24 GB | **1** |
 | **Blocked-Tuned** | **141** | **138** | **1.01 %** ✅ | 0.26 GB | **1** |
 
-Вывод:
-- **XXH3 vs Murmur3 — паритет.** Когда фильтр не влезает в кеш, выбор хеша не влияет.
-- **Blocked даёт ×2.9** — за счёт схлопывания 7 промахов кеша в 1.
-- **«Голый» Blocked жертвует точностью** (1.44 % вместо 1.00 %) из-за неравномерной
-  загрузки блоков (распределение Пуассона по блокам).
-- **Blocked-Tuned** возвращает точность к таргету ценой **+10 % памяти** — лучший
-  баланс, когда RAM есть.
+Takeaways:
+- **XXH3 vs Murmur3 — a tie.** Once the filter doesn't fit in cache, hash choice
+  is irrelevant.
+- **Blocked gives ~2.9×** by collapsing 7 cache misses into 1.
+- **Plain Blocked trades accuracy** (1.44 % instead of 1.00 %) because of uneven
+  block load (Poisson distribution of keys across blocks).
+- **Blocked-Tuned** brings accuracy back to target at the cost of **+10 % memory** —
+  the best balance when you have spare RAM.
 
-На *маленьких* фильтрах (помещающихся в L3, < ~700K элементов при 1% FP) XXH3
-действительно немного быстрее Murmur3 (на коротких ключах ~10–15 %), потому что там
-доминирует уже вычисление, а не память. Это видно в микро-бенчмарках.
+On *small* filters (those that fit in L3, < ~700K elements at 1% FP) XXH3 really is
+a bit faster than Murmur3 (~10–15 % on short keys), because there computation
+dominates rather than memory. That shows up in the micro-benchmarks.
 
-## Какое «удобное свойство» XXH3 мы используем
+## The "convenient property" of XXH3 we rely on
 
-Не скорость. Мы используем то, что **один alloc-free вызов `xxh3.Hash128` отдаёт
-ровно ту форму данных, которая нужна blocked-фильтру**:
+Not speed. We rely on the fact that **a single alloc-free `xxh3.Hash128` call hands
+back exactly the shape of data a blocked filter needs**:
 
 ```go
-h := xxh3.Hash128(data)        // один вызов, ноль аллокаций, 128 бит
-blockIdx := h.Hi % numBlocks   // старшие 64 бита → выбираем cache line
-h1 := uint32(h.Lo)             // младшие 64 бита, нижняя половина
-h2 := uint32(h.Lo >> 32)       //                  верхняя половина
-// k позиций внутри блока — трюк Кирша-Митценмахера:
+h := xxh3.Hash128(data)        // one call, zero allocations, 128 bits
+blockIdx := h.Hi % numBlocks   // high 64 bits → pick the cache line
+h1 := uint32(h.Lo)             // low 64 bits, lower half
+h2 := uint32(h.Lo >> 32)       //              upper half
+// k positions inside the block — Kirsch-Mitzenmacher double hashing:
 //   bit_i = (h1 + i*h2) mod 512
 ```
 
-То есть из одного хеша мы бесплатно получаем и **индекс блока**, и **семя для
-double-hashing** внутри блока — без второго прохода по данным и без кучи. Классический
-`bits-and-blooms` для этого гоняет Murmur3-128 дважды (см. `sum256`); нам хватает
-одного `Hash128`. Это упрощение, а не ускорение хеша как такового.
+So from one hash we get both the **block index** and the **seed for in-block
+double-hashing** for free — no second pass over the data, no heap. The classic
+`bits-and-blooms` runs Murmur3-128 twice for this (see `sum256`); one `Hash128` is
+enough for us. That's a simplification, not a faster hash.
 
-## Использование
+## Usage
 
 ```go
 import bloom "github.com/ruslano69/xxh3-bloom"
 
-// Классический (минимум памяти, точный FP)
+// Classic (minimum memory, exact FP)
 f := bloom.NewWithEstimates(1_000_000, 0.01)
 f.Add([]byte("key"))
 ok := f.Test([]byte("key"))
 
-// Cache-local (нужен throughput, точность некритична)
+// Cache-local (need throughput, accuracy not critical)
 b := bloom.NewBlocked(1_000_000, 0.01)
 
-// Cache-local + точный FP (есть свободная RAM)
+// Cache-local + exact FP (you have spare RAM)
 t := bloom.NewBlockedTuned(1_000_000, 0.01)
 ```
 
-Выбор тира:
+Picking a tier:
 
 ```
-Память в дефиците, точность критична   → Filter (классический)
-Память есть, нужен throughput          → NewBlockedTuned
-Точность не критична, нужна скорость    → NewBlocked
+Memory-constrained, accuracy critical   → Filter (classic)
+Have RAM, need throughput               → NewBlockedTuned
+Accuracy not critical, want raw speed   → NewBlocked
 ```
 
-### Сериализация (только blocked-тиры)
+### Serialization (blocked tiers only)
 
 ```go
-// на диск
+// to disk
 fd, _ := os.Create("filter.bbf")
 w := bufio.NewWriter(fd)
 t.WriteTo(w)
 w.Flush(); fd.Close()
 
-// с диска
+// from disk
 var loaded bloom.BlockedFilter
 fd2, _ := os.Open("filter.bbf")
 loaded.ReadFrom(bufio.NewReader(fd2))
 ```
 
-Битовый массив пишется сырым дампом через `unsafe` (без рефлексии — иначе GB-фильтр
-сериализовался бы минутами). **Оговорка:** тело хранится в нативном порядке байт →
-файл не переносится между little/big-endian машинами. Magic-байты ловят битый формат.
+The bit array is dumped raw via `unsafe` (no reflection — a GB-scale filter would
+take minutes through `binary.Write`). **Caveat:** the payload is stored in native
+byte order, so files are **not portable across little/big-endian machines**. Magic
+bytes catch a malformed stream.
 
-## Воспроизвести бенчмарки
+## Reproduce the benchmarks
 
 ```bash
-# микро-бенчмарки (в кеше): здесь XXH3 чуть быстрее Murmur3
+# micro-benchmarks (in cache): here XXH3 is slightly faster than Murmur3
 go test -run='^$' -bench='Benchmark' -benchmem -benchtime=3s
 
-# end-to-end (вне кеша): здесь решает blocked, не хеш
+# end-to-end (out of cache): here blocking wins, not the hash
 go run ./cmd/e2e/ -capacity 200000000 -fill 100 -blocked -tuned
 ```
 
-Флаги стенда: `-capacity`, `-fill` (%), `-fp`, `-queries`, `-compare` (добавить
+Harness flags: `-capacity`, `-fill` (%), `-fp`, `-queries`, `-compare` (add
 Murmur3), `-blocked`, `-tuned`.
 
-## Происхождение идеи
+## Origin of the idea
 
-Blocked Bloom filter — известный класс, не наше изобретение: см.
-Putze, Sanders, Singler, *"Cache-, Hash- and Space-Efficient Bloom Filters"* (2007).
-Наш вклад — рабочая Go-реализация с авто-тюнингом числа блоков под целевой FP,
-сериализацией и воспроизводимым стендом, который показывает, *откуда именно* берётся
-выигрыш.
+The blocked Bloom filter is a well-known class, not our invention: see
+Putze, Sanders & Singler, *"Cache-, Hash- and Space-Efficient Bloom Filters"* (2007).
+Our contribution is a working Go implementation with automatic block-count tuning
+for a target FP, serialization, and a reproducible harness that shows *exactly where*
+the win comes from.
 
-## Зависимости
+## Dependencies
 
-- [`github.com/bits-and-blooms/bitset`](https://github.com/bits-and-blooms/bitset) — битовый массив классического тира (BSD-3)
+- [`github.com/bits-and-blooms/bitset`](https://github.com/bits-and-blooms/bitset) — bit array for the classic tier (BSD-3)
 - [`github.com/zeebo/xxh3`](https://github.com/zeebo/xxh3) — XXH3-128 (BSD-2)
-- [`github.com/bits-and-blooms/bloom/v3`](https://github.com/bits-and-blooms/bloom) — только для сравнительных бенчмарков (BSD-3)
+- [`github.com/bits-and-blooms/bloom/v3`](https://github.com/bits-and-blooms/bloom) — benchmark baseline only (BSD-3)
 
-## Лицензия
+## License
 
-MIT — см. [LICENSE](LICENSE). Совместима с BSD-лицензиями зависимостей (все
-разрешительные). Blocked-дизайн следует технике из Putze–Sanders–Singler (2007);
-реализация — оригинальная.
+MIT — see [LICENSE](LICENSE). Compatible with the BSD licenses of the dependencies
+(all permissive). The blocked design follows the technique from Putze–Sanders–Singler
+(2007); the implementation is original.
