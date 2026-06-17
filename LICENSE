@@ -32,6 +32,7 @@ against, the following libraries. Their own licenses apply to their code:
   github.com/bits-and-blooms/bloom/v3    BSD 3-Clause License  (benchmark baseline only)
   github.com/zeebo/xxh3                  BSD 2-Clause License
   github.com/twmb/murmur3                BSD 3-Clause License
+  github.com/dchest/siphash              CC0 1.0 (public domain)
 
 The blocked-filter design follows the technique described in
 Putze, Sanders & Singler, "Cache-, Hash- and Space-Efficient Bloom Filters"

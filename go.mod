@@ -5,6 +5,7 @@ go 1.26.4
 require (
 	github.com/bits-and-blooms/bitset v1.24.5
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
+	github.com/dchest/siphash v1.2.3
 	github.com/twmb/murmur3 v1.1.8
 	github.com/zeebo/xxh3 v1.1.0
 )

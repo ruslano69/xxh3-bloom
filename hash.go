@@ -3,6 +3,7 @@ package bloom
 import (
 	"fmt"
 
+	"github.com/dchest/siphash"
 	"github.com/twmb/murmur3"
 	"github.com/zeebo/xxh3"
 )
@@ -23,9 +24,19 @@ const (
 	// is necessary but not sufficient for bit-level interop with another
 	// library — the location formula and bit layout must match too.
 	Murmur3 HashKind = 2
+	// SipHash is SipHash-2-4 (128-bit), a keyed PRF. It is the DoS-resistant
+	// option, but ONLY when paired with a secret WithSeed: the seed is its key,
+	// so an attacker who does not know it cannot craft poisoning inputs. Without
+	// a seed it is just a (slower) deterministic hash. Prefer this for keys that
+	// come from untrusted sources. See the threat-model notes in the README.
+	SipHash HashKind = 3
 
 	customHashFloor HashKind = 128
 )
+
+// sipK1 is a fixed second key half for SipHash domain separation; the secret
+// lives in the seed (k0).
+const sipK1 = 0x9e3779b97f4a7c15
 
 // Hasher returns a 128-bit hash (hi, lo) of data, keyed by seed.
 type Hasher func(data []byte, seed uint64) (hi, lo uint64)
@@ -33,6 +44,7 @@ type Hasher func(data []byte, seed uint64) (hi, lo uint64)
 var hashRegistry = map[HashKind]Hasher{
 	XXH3:    xxh3Hash,
 	Murmur3: murmur3Hash,
+	SipHash: siphashHash,
 }
 
 func xxh3Hash(data []byte, seed uint64) (uint64, uint64) {
@@ -42,6 +54,10 @@ func xxh3Hash(data []byte, seed uint64) (uint64, uint64) {
 
 func murmur3Hash(data []byte, seed uint64) (uint64, uint64) {
 	return murmur3.SeedSum128(seed, seed, data)
+}
+
+func siphashHash(data []byte, seed uint64) (uint64, uint64) {
+	return siphash.Hash128(seed, sipK1, data)
 }
 
 // RegisterHash registers a custom Hasher under kind (which must be >= 128).
@@ -73,6 +89,8 @@ func (h HashKind) String() string {
 		return "XXH3"
 	case Murmur3:
 		return "Murmur3"
+	case SipHash:
+		return "SipHash"
 	default:
 		return fmt.Sprintf("HashKind(%d)", uint8(h))
 	}

@@ -321,7 +321,7 @@ func TestSeededSerializationRoundTrip(t *testing.T) {
 }
 
 func TestPluggableHashNoFalseNegatives(t *testing.T) {
-	for _, kind := range []xxhbloom.HashKind{xxhbloom.XXH3, xxhbloom.Murmur3} {
+	for _, kind := range []xxhbloom.HashKind{xxhbloom.XXH3, xxhbloom.Murmur3, xxhbloom.SipHash} {
 		classic := xxhbloom.NewWithEstimates(20_000, 0.01, xxhbloom.WithHash(kind))
 		blocked := xxhbloom.NewBlockedTuned(20_000, 0.01, xxhbloom.WithHash(kind), xxhbloom.WithSeed(7))
 		buf := make([]byte, 8)
@@ -357,6 +357,35 @@ func TestDifferentHashDiffersBits(t *testing.T) {
 	}
 	if a.Equal(b) {
 		t.Fatal("XXH3 and Murmur3 produced identical bits")
+	}
+}
+
+// SipHash's DoS resistance comes from the secret seed: the same keys under two
+// different seeds must land on different bits, or an attacker could precompute
+// poisoning inputs regardless of the secret.
+func TestSipHashSeedSeparation(t *testing.T) {
+	a := xxhbloom.NewBlocked(10_000, 0.01, xxhbloom.WithHash(xxhbloom.SipHash), xxhbloom.WithSeed(0xA1))
+	b := xxhbloom.NewBlocked(10_000, 0.01, xxhbloom.WithHash(xxhbloom.SipHash), xxhbloom.WithSeed(0xB2))
+	buf := make([]byte, 8)
+	for i := 0; i < 10_000; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		a.Add(buf)
+		b.Add(buf)
+	}
+	if a.Equal(b) {
+		t.Fatal("SipHash under different seeds produced identical bits")
+	}
+	// round-trips as v4 with hash + seed preserved
+	blob, _ := a.MarshalBinary()
+	if blob[4] != 4 {
+		t.Fatalf("SipHash filter must serialize as v4, got %d", blob[4])
+	}
+	var dst xxhbloom.BlockedFilter
+	if err := dst.UnmarshalBinary(blob); err != nil {
+		t.Fatalf("UnmarshalBinary: %v", err)
+	}
+	if dst.Hash() != xxhbloom.SipHash || dst.Seed() != 0xA1 {
+		t.Fatalf("hash/seed not preserved: hash=%v seed=%#x", dst.Hash(), dst.Seed())
 	}
 }
 

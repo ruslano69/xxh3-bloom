@@ -97,10 +97,17 @@ unchanged. (The older `*WithSeed` constructors remain as deprecated shorthands.)
 
 ### Hash function
 
-The default hash is `XXH3`. `WithHash(bloom.Murmur3)` switches to MurmurHash3-128,
-and you can register your own with `RegisterHash(kind, hasher)` (kind ≥ 128). The
-chosen hash is recorded in the serialized form, so a filter always reloads with
-the hash it was built with.
+Built-in hashes, selected with `WithHash`:
+
+| Kind | What | When |
+|---|---|---|
+| `XXH3` (default) | fast, alloc-free 128-bit | trusted keys, max speed |
+| `Murmur3` | MurmurHash3-128 | matches `bits-and-blooms` scheme |
+| `SipHash` | SipHash-2-4, keyed PRF | untrusted keys — DoS-resistant **with** `WithSeed` |
+
+You can also register your own with `RegisterHash(kind, hasher)` (kind ≥ 128).
+The chosen hash is recorded in the serialized form, so a filter always reloads
+with the hash it was built with.
 
 ⚠️ **Selecting `Murmur3` matches the hash used by `bits-and-blooms/bloom`, but
 that alone does not make the filters bit-compatible** — true interop also requires
@@ -163,23 +170,30 @@ poisoning**: an attacker who knows your fixed hash can craft inputs that
 maximize false positives (making the filter pass everything and stop protecting
 the backend), or, for a blocked filter, saturate one specific cache line.
 
-The mitigation is to turn XXH3 into a **keyed** hash with a secret per-process
-seed (`RandomSeed()` + a `*WithSeed` constructor). Without the seed an attacker
-can no longer precompute colliding inputs offline — which removes the vast
-majority of the incentive to attack.
+Two levels of mitigation, both via `WithSeed(RandomSeed())`:
+
+```go
+// Good: XXH3 keyed by a secret seed — defeats offline precomputation, fast.
+bloom.NewBlockedTuned(n, fp, bloom.WithSeed(secret))
+
+// Stronger: SipHash, a keyed cryptographic PRF — the conservative choice.
+bloom.NewBlockedTuned(n, fp, bloom.WithSeed(secret), bloom.WithHash(bloom.SipHash))
+```
 
 ```
 Keys are YOUR data (file paths, internal IDs you generate)   → unseeded is fine
-Keys come from untrusted users who benefit from poisoning    → use *WithSeed
+Untrusted keys, want speed                                   → XXH3 + WithSeed
+Untrusted keys, want the rigorous guarantee                  → SipHash + WithSeed
 ```
 
-⚠️ **Caveat — not a MAC.** XXH3 with a seed is *not* a proven cryptographic
-primitive the way SipHash (used by the `bloomfilter` crate, and by Rust/Python
-hash maps) or HMAC is. Seeding defeats offline precomputation, which covers the
-practical threat, but against a determined adversary who can mount adaptive
-online attacks, prefer a keyed cryptographic hash. This is the same speed ↔
-abuse-resistance tradeoff measured in [`bench/rust`](bench/rust): SipHash costs
-~1.8× to buy a stronger guarantee.
+**Why two levels.** Seeded XXH3 defeats *offline* collision precomputation,
+which covers the practical threat cheaply. But XXH3 is not a proven crypto
+primitive: against a determined adversary mounting *adaptive online* attacks,
+`SipHash` (a keyed PRF, the same family Rust/Python hash maps use) is the
+conservative choice. SipHash is slower — the speed ↔ abuse-resistance tradeoff
+measured in [`bench/rust`](bench/rust) (~1.8×) — but now it's a one-line option
+rather than a different library. **SipHash without a seed gives no DoS
+resistance** — the seed is its key.
 
 ## Reproduce the benchmarks
 
@@ -213,6 +227,7 @@ the win comes from.
 - [`github.com/bits-and-blooms/bitset`](https://github.com/bits-and-blooms/bitset) — bit array for the classic tier (BSD-3)
 - [`github.com/zeebo/xxh3`](https://github.com/zeebo/xxh3) — XXH3-128, the default hash (BSD-2)
 - [`github.com/twmb/murmur3`](https://github.com/twmb/murmur3) — MurmurHash3-128 for `WithHash(Murmur3)` (BSD-3)
+- [`github.com/dchest/siphash`](https://github.com/dchest/siphash) — SipHash-2-4-128 for `WithHash(SipHash)` (CC0)
 - [`github.com/bits-and-blooms/bloom/v3`](https://github.com/bits-and-blooms/bloom) — benchmark baseline only (BSD-3)
 
 ## License
