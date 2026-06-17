@@ -122,7 +122,10 @@ struct BlockedXXH3 {
 }
 impl BlockedXXH3 {
     fn new(n: usize, fp: f64) -> Self {
-        Self::with_range(n, fp, false)
+        // fastrange is the default: it is strictly faster and we keep no on-disk
+        // format, so there is nothing to stay compatible with. `blocked-mod` still
+        // builds the modulo variant for A/B comparison.
+        Self::with_range(n, fp, true)
     }
     fn with_range(n: usize, fp: f64, fastrange: bool) -> Self {
         let (m, k) = estimate(n, fp);
@@ -479,9 +482,9 @@ fn main() {
             "Rust classic (our XXH3 scheme)",
             Box::new(ClassicXXH3::new(capacity as usize, fp_rate)),
         ),
-        "blocked-fr" => (
-            "Rust blocked (XXH3, fastrange block index)",
-            Box::new(BlockedXXH3::with_range(capacity as usize, fp_rate, true)),
+        "blocked-mod" => (
+            "Rust blocked (XXH3, modulo block index — baseline)",
+            Box::new(BlockedXXH3::with_range(capacity as usize, fp_rate, false)),
         ),
         #[cfg(target_arch = "x86_64")]
         "simd" => (

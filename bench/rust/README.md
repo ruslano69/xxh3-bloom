@@ -11,7 +11,8 @@ Three modes (`--mode`):
 |---|---|
 | `siphash` | the [`bloomfilter`](https://crates.io/crates/bloomfilter) crate (classic, SipHash-1-3) — external baseline |
 | `classic` | our classic filter ported to Rust (XXH3-128, identical scheme to the Go `Filter`) |
-| `blocked` | our cache-local blocked filter ported to Rust (XXH3-128, identical to the Go `BlockedFilter`) |
+| `blocked` | our cache-local blocked filter (XXH3-128). **Defaults to fastrange** block index `(hi*N)>>64` — strictly faster than modulo, and since the Rust bench keeps no on-disk format there is nothing to stay compatible with |
+| `blocked-mod` | same, but the **modulo** block index `hi % N` — the baseline kept for A/B comparison |
 | `simd` | **AVX2 split-block** filter (Impala/Parquet style, 256-bit block, k=8) — a *different* layout, used to isolate what SIMD buys (x86-64 only) |
 | `simd512` | AVX2 split-block, **512-bit block = one full cache line** (8 lanes × 64 bits, k=8) — trades a little speed for lower FP (x86-64 only) |
 
@@ -20,19 +21,25 @@ cargo run --release -- --mode blocked  --capacity 200000000 --fill 100
 cargo run --release -- --mode classic  --capacity 200000000 --fill 100
 cargo run --release -- --mode siphash  --capacity 200000000 --fill 100
 cargo run --release -- --mode simd     --capacity 200000000 --fill 100   # AVX2
+cargo run --release -- --batch         --capacity 200000000 --fill 100   # MLP sweep
 ```
 
-Flags: `--mode`, `--capacity`, `--fill` (%), `--fp`, `--queries`.
+Flags: `--mode`, `--capacity`, `--fill` (%), `--fp`, `--queries`, `--batch`.
+
+> **Note on the timing tables below.** They were measured before `blocked` was
+> switched to fastrange by default, so rows labeled `blocked` there reflect the
+> **modulo** baseline (now `blocked-mod`). Fastrange is ~1.6× faster on fill and
+> ~1.3× on query — see the "fastrange" A/B and the batch sweep, which already use it.
 
 ## Why this matters
 
-The `classic` and `blocked` modes use the **exact same XXH3-128 values and bit
+The `classic` and `blocked-mod` modes use the **exact same XXH3-128 values and bit
 formulas** as the Go code (including the v0.7.0 enhanced double-hashing probe
-scheme). This was verified empirically: the false-positive *counts* match Go
-bit-for-bit (the classic tier produced an identical `100,381` over 10M negative
-queries), proving `zeebo/xxh3` and `xxhash-rust` produce identical hashes and that
-the port is faithful. Any remaining timing difference is therefore purely
-language/runtime.
+scheme; `blocked` itself now defaults to fastrange, which Go does not). This was
+verified empirically: the false-positive *counts* match Go bit-for-bit (the classic
+tier produced an identical `100,381` over 10M negative queries), proving
+`zeebo/xxh3` and `xxhash-rust` produce identical hashes and that the port is
+faithful. Any remaining timing difference is therefore purely language/runtime.
 
 ## Measured results (Intel i7-7700, 200M elements, 100% fill, FP target 1%)
 
