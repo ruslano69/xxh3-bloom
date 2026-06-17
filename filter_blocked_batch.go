@@ -3,10 +3,13 @@ package bloom
 import "unsafe"
 
 // batchWindow is how many keys are hashed-and-prefetched before the probe pass.
-// ~16 keeps enough cache-line misses in flight to overlap memory latency
+// 32 keeps enough cache-line misses in flight to overlap memory latency
 // (memory-level parallelism) without the prefetched lines being evicted before
-// they are used. This matches the sweet spot measured in the Rust bench.
-const batchWindow = 16
+// they are used. An out-of-cache window sweep (Go and Rust, blocked and simd)
+// peaks at 32: 16 leaves throughput on the table, beyond ~64 the working set
+// grows and prefetched lines start getting evicted. Shared by the blocked and
+// simd batch paths.
+const batchWindow = 32
 
 // batchProbe holds the per-key state computed in the prefetch pass so the probe
 // pass does not have to re-hash.
