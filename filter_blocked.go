@@ -207,6 +207,13 @@ func newAlignedBlocks(numBlocks uint64) (view, backing []uint64) {
 // plus the two 32-bit sub-hashes used to derive the k bit positions.
 func (f *BlockedFilter) blockOffset(data []byte) (off uint64, h1, h2 uint32) {
 	hi, lo := f.hasher(data, f.seed)
+	return f.blockOffsetHash(hi, lo)
+}
+
+// blockOffsetHash is blockOffset for a key whose 128-bit hash (hi, lo) is
+// already known, skipping the internal hasher. It is the shared core of the
+// hashed-input fast path (AddHash/TestHash).
+func (f *BlockedFilter) blockOffsetHash(hi, lo uint64) (off uint64, h1, h2 uint32) {
 	// fastrange (Lemire): map hi into [0,numBlocks) with a widening multiply +
 	// shift instead of a 64-bit DIV. modulo is kept for filters loaded from v5.
 	var blockIdx uint64
@@ -224,18 +231,53 @@ func (f *BlockedFilter) blockOffset(data []byte) (off uint64, h1, h2 uint32) {
 // Add inserts data. Touches exactly one cache line.
 func (f *BlockedFilter) Add(data []byte) *BlockedFilter {
 	off, a, b := f.blockOffset(data)
-	for i := uint(0); i < f.k; i++ {
-		bit := a & blockMask
-		f.blocks[off+uint64(bit>>6)] |= 1 << (bit & 63)
-		a += b
-		b += uint32(i) // enhanced double hashing: triangular term breaks linear collisions
-	}
+	addBits(f, off, a, b)
 	return f
 }
 
 // Test reports possible membership. Touches exactly one cache line.
 func (f *BlockedFilter) Test(data []byte) bool {
 	off, a, b := f.blockOffset(data)
+	return testBits(f, off, a, b)
+}
+
+// AddHash inserts a key given its precomputed 128-bit hash (hi, lo), bypassing
+// the filter's internal hasher and the []byte interface. Use it when the caller
+// already holds an xxh3-128 of the key — e.g. a filesystem-wide name index keyed
+// by xxh3(dir‖name) — to avoid a second hash pass and a key allocation.
+//
+// The (hi, lo) pair must be produced the same way for AddHash and TestHash on a
+// given key. The filter's own seed is NOT applied on this path: fold any keying
+// or scoping into the hash you pass (e.g. hash the name seeded by the directory
+// id). Mixing AddHash with the []byte Add on the same filter is fine as long as
+// each key is always inserted and tested through the same one.
+func (f *BlockedFilter) AddHash(hi, lo uint64) *BlockedFilter {
+	off, a, b := f.blockOffsetHash(hi, lo)
+	addBits(f, off, a, b)
+	return f
+}
+
+// TestHash reports possible membership for a key given its precomputed 128-bit
+// hash (hi, lo). It is the hashed-input counterpart of Test; see AddHash for the
+// contract on producing (hi, lo).
+func (f *BlockedFilter) TestHash(hi, lo uint64) bool {
+	off, a, b := f.blockOffsetHash(hi, lo)
+	return testBits(f, off, a, b)
+}
+
+// addBits / testBits are the shared k-probe loops (enhanced double hashing: the
+// triangular term breaks linear collisions). Shared by the []byte and hashed
+// fast paths so both layouts stay bit-for-bit identical.
+func addBits(f *BlockedFilter, off uint64, a, b uint32) {
+	for i := uint(0); i < f.k; i++ {
+		bit := a & blockMask
+		f.blocks[off+uint64(bit>>6)] |= 1 << (bit & 63)
+		a += b
+		b += uint32(i)
+	}
+}
+
+func testBits(f *BlockedFilter, off uint64, a, b uint32) bool {
 	for i := uint(0); i < f.k; i++ {
 		bit := a & blockMask
 		if f.blocks[off+uint64(bit>>6)]&(1<<(bit&63)) == 0 {
